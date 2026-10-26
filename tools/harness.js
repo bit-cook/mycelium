@@ -35,11 +35,20 @@ const 假文档 = () => {
   };
 };
 
-export async function harness({ autonomy = 'auto', headless = true } = {}) {
-  const doc = 假文档();
+export async function harness({ autonomy = 'auto', headless = true, doc: 外来doc = null } = {}) {
+  const doc = 外来doc || 假文档();
   // 导出(hypha.build)要从"文件"里取内核文本和启动器: harness 里喂真的
-  doc.按id.set('hypha', { textContent: 内核源码 });
-  doc.按id.set('hypha-launcher', { textContent: 启动器源码 });
+  doc.按id?.set('hypha', { textContent: 内核源码 });
+  doc.按id?.set('hypha-launcher', { textContent: 启动器源码 });
+  if (外来doc) {
+    // 自定义文档(迷你 DOM): 内核/启动器也作为真元素挂进树, boot 时才读得到原文
+    for (const [id, 文] of [['hypha', 内核源码], ['hypha-launcher', 启动器源码]]) {
+      const el = doc.createElement('script');
+      el.setAttribute('id', id);
+      el.textContent = 文;
+      doc.body.appendChild(el);
+    }
+  }
   const env = {
     doc, win: { addEventListener() { }, removeEventListener() { } },
     ls: null, idb: null,                       // 无 localStorage / 无 IndexedDB → 全内存
@@ -51,8 +60,17 @@ export async function harness({ autonomy = 'auto', headless = true } = {}) {
     console, CustomEvent, TextEncoder, TextDecoder, structuredClone, crypto: webcrypto,
     AbortController, setTimeout, clearTimeout, btoa, atob,
     fetch: (...a) => env.fetch(...a),           // 块里裸调的 fetch 走 env, 测试可换
+    document: doc,                              // 块是浏览器代码: 全局 document/window 必须真
+    localStorage: null, indexedDB: null,
   };
   沙箱.globalThis = 沙箱;
+  沙箱.window = 沙箱;                            // 浏览器语义: window 就是全局(内核据此挂 mycelium)
+  沙箱.location = { search: '' };
+  沙箱.addEventListener = () => { };
+  沙箱.removeEventListener = () => { };
+  沙箱.alert = () => { };            // 块的界面代码会弹框(测试里空转)
+  沙箱.confirm = () => true;
+  沙箱.prompt = () => null;
   vm.createContext(沙箱);
   vm.runInContext(内核源码, 沙箱, { filename: 'hypha.js' });
   await 沙箱.mycelium.boot(env);
@@ -68,8 +86,18 @@ export async function harness({ autonomy = 'auto', headless = true } = {}) {
       const text = readFileSync(join(根, file), 'utf8');
       const m = /^\/\/ @nodule (\{[\s\S]*?\})/.exec(text) || {};
       const id = JSON.parse(m[1] || '{}').id || file;
-      doc.块.push({ textContent: text, getAttribute: k => k === 'data-id' ? id
-        : k === 'data-disabled' ? (disabled ? '1' : null) : null });
+      if (外来doc) {
+        // 自定义文档(迷你 DOM): 块标签作为真元素挂在树里, 内核的 querySelectorAll 找得到
+        const el = doc.createElement('script');
+        el.setAttribute('type', 'mycelium/nodule');
+        el.setAttribute('data-id', id);
+        if (disabled) el.setAttribute('data-disabled', '1');
+        el.textContent = text;
+        doc.body.appendChild(el);
+      } else {
+        doc.块.push({ textContent: text, getAttribute: k => k === 'data-id' ? id
+          : k === 'data-disabled' ? (disabled ? '1' : null) : null });
+      }
       return h.reboot();
     },
     // 桩一个能力: 直接顶掉 CAP 里同名的(测试替身的正业), 回取消函数

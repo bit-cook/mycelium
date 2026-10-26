@@ -12,7 +12,7 @@ font-family:-apple-system,"PingFang SC",sans-serif}
 </style>
 </head>
 <body>
-<!--MYCELIUM-LINEAGE {"id":"b381fa131a71063f","parent":"","at":"2026-10-26T18:21:14.320Z","blocks":[{"id":"agent","version":1},{"id":"ai","version":1},{"id":"desktop","version":1},{"id":"pocket","version":1}]}-->
+<!--MYCELIUM-LINEAGE {"id":"b3420b30b3497974","parent":"","at":"2026-10-26T19:45:43.071Z","blocks":[{"id":"agent","version":1},{"id":"ai","version":1},{"id":"desktop","version":1},{"id":"pocket","version":1}]}-->
 <div id="mycelium-root"></div>
 <script id="hypha">
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -640,6 +640,8 @@ font-family:-apple-system,"PingFang SC",sans-serif}
   const assembleAll = async () => {
     L.booting = true; L.errors = {}; L.broken = [];
     L.factory = [];
+    // 上一次的兜底面板撤掉: 界面块可能回来了(它画在 mycelium-root 里, 会盖住块的界面)
+    if (doc()) doc().querySelectorAll('[data-k-panel]').forEach(el => el.remove());
     if (doc()) doc().querySelectorAll(`${SCR}[type="mycelium/nodule"]`).forEach(el => {
       try {
         const b = parseBlock(el.textContent);
@@ -1489,8 +1491,12 @@ ${b.broken || b.adopted || b.id === 'hypha' ? '' :
     },
   };
   P('hypha.panel', a => {
-    const host = a?.host?.appendChild ? a.host : doc().createElement('div');   // 同页调用可以直接给元素
-    if (!a?.host?.appendChild) (doc().getElementById('mycelium-root') || doc().body).appendChild(host);
+    let host = a?.host;
+    if (!host?.appendChild) {                     // 没给宿主: 自带一个壳(壳有标记, 重新装配时撤掉)
+      host = doc().createElement('div');
+      host.setAttribute('data-k-panel', '1');
+      (doc().getElementById('mycelium-root') || doc().body).appendChild(host);
+    }
     面板.画(host);
     return true;
   }, '把裸壳面板画进 host(桌面块的设置窗用它; 不给就画在页面根部)', { host: {} }, false);
@@ -1525,8 +1531,11 @@ ${b.broken || b.adopted || b.id === 'hypha' ? '' :
       if (Net.外) Net.外.expose('call', a2 => Net.call(a2.path, a2.args));
       try { LS()?.setItem(BOOT.key + '.crash', '0'); } catch (_) { }
       if (doc() && !env.boot.headless && !Net.has('ui.host')) {   // 没有界面块: 内核兜底面板, 系统永远可操作
-        const host = doc().getElementById('mycelium-root') || doc().body;
-        面板.画(host);
+        const host = doc().getElementById('mycelium-root') || doc().body,
+          壳 = doc().createElement('div');
+        壳.setAttribute('data-k-panel', '1');       // 标记打在壳上(不是根): 重新装配时撤壳, 别动根
+        host.appendChild(壳);
+        面板.画(壳);
       }
     } catch (e) { banner('启动失败: ' + e.message); throw e; }
   };
@@ -2519,6 +2528,7 @@ function 任务栏() {
   栏.innerHTML = [...UI.apps.values()].map(a =>
     `<button class="u-dock" data-app="${esc(a.id)}" title="${esc(a.name)}">${a.icon || '📦'}</button>`).join('')
     + `<span class="u-dsp"></span>`
+    + `<button class="u-dock" data-act="agent" title="全能 agent 对话栏">💬</button>`
     + ['设置', '口袋', '示波器', '模型'].map(k =>
       `<button class="u-dock" data-win="${k}" title="${k}">${k === '设置' ? '⚙' : k === '口袋' ? '🎒' : k === '示波器' ? '📈' : '🧠'}</button>`).join('');
 }
@@ -2653,9 +2663,16 @@ const 桌面 = {
 .u-muted{color:var(--text-muted);font-size:11px}
 #pick-tip{position:fixed;left:12px;bottom:56px;background:var(--warn);color:#1a1a1a;font-size:12px;
   padding:6px 12px;border-radius:8px;z-index:200}
-#agent-dock{position:fixed;right:12px;bottom:52px;width:380px;height:480px;background:var(--bg-2);
-  border:1px solid var(--border);border-radius:var(--radius);z-index:90;display:none;flex-direction:column;overflow:hidden}
-#agent-dock.in{display:flex}`,
+#agent-dock{position:fixed;right:12px;bottom:56px;width:380px;height:480px;background:var(--bg-2);
+  border:1px solid var(--border);border-radius:var(--radius);z-index:90;display:none;flex-direction:column;overflow:hidden;
+  box-shadow:0 12px 40px rgba(0,0,0,.5)}
+#agent-dock.in{display:flex}
+#agent-dock .ag-bar{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--surface);
+  border-bottom:1px solid var(--border);font-size:12px;font-weight:600;cursor:move;user-select:none}
+#agent-dock .ag-bar .sp{flex:1}
+#agent-dock .ag-bar button{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:2px 7px;border-radius:4px}
+#agent-dock .ag-bar button:hover{background:var(--surface-hover);color:var(--text)}
+#agent-dock .ag-host{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}`,
   画() {
     const 样式 = document.createElement('style');
     样式.textContent = 桌面.样式;
@@ -2669,7 +2686,13 @@ const 桌面 = {
     document.body.appendChild(坞);
     const 代 = document.createElement('div');
     代.id = 'agent-dock';
+    代.innerHTML = `<div class="ag-bar">🤖 全能 agent<span class="sp"></span>
+<button data-a="min" title="收起">–</button></div><div class="ag-host"></div>`;
     document.body.appendChild(代);
+    听(代, 'click', e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      if (钮.dataset.a === 'min') 代.classList.remove('in');
+    });
     ctx.cleanup(() => { 桌.remove(); 坞.remove(); 代.remove(); 样式.remove(); });
     // 桌面点选: 点中的元素连选择器一起进卡片
     听(桌, 'click', e => {
@@ -2685,8 +2708,13 @@ const 桌面 = {
     听(坞, 'click', e => {
       const 钮 = e.target.closest('button'); if (!钮) return;
       if (钮.dataset.app) 开孢子(钮.dataset.app).catch(err => alert(err.message));
-      if (钮.dataset.win) {
+      if (钮.dataset.act === 'agent') {
+        const 代 = $('#agent-dock');
+        if (代) 代.classList.toggle('in');
+      }      if (钮.dataset.win) {
         const k = 钮.dataset.win;
+        // 口袋块自己开着窗(收编开的)就直接前置, 不重复挂一份
+        if (k === '口袋' && UI.wins.has('block:pocket')) { 窗.前置('block:pocket'); return; }
         if (UI.wins.has(k)) 窗.前置(k);
         else 窗.开(k, { 题: k, 宽: k === '设置' ? 620 : 480, 高: 460, 内容: 内置[k] });
       }
@@ -2737,10 +2765,40 @@ ctx.provide('apps.open', a => 开孢子(a.id).then(() => ({ ok: true })), { desc
 ctx.provide('apps.update', a => 应用.改(a.id, a.html).then(() => ({ ok: true })), { desc: '改一个小应用的代码',
   schema: { id: { type: 'string' }, html: { type: 'string' } } });
 ctx.provide('ui.host', () => true, { desc: '本块在跑: 有桌面(内核因此不挂兜底面板)', schema: {} });
+// ══════════ 收编 ══════════
+// 桌面是布局的唯一主人: 别的块的界面(ctx.root)本来在页面上流式堆着, 会被 #desk 盖住——
+// 把它们收进该去的地方: agent → 右下对话栏; 别的块 → 各自的窗。块后装/被替换都会再收一次。
+const 收编 = async () => {
+  const 根们 = [...document.querySelectorAll('#mycelium-root > [data-nodule-id]')];
+  if (!根们.length) return;
+  let 名 = {};
+  try { 名 = Object.fromEntries((await ctx.call('hypha.nodules')).map(b => [b.id, b])); } catch (e) { }
+  for (const el of 根们) {
+    const id = el.dataset.noduleId;
+    if (id === 'desktop' || el.dataset.已收编) continue;
+    el.dataset.已收编 = '1';
+    const 块 = 名[id] || {};
+    el.style.height = '100%';
+    if (id === 'agent') {
+      // 全能 agent: 右下常驻对话栏(默认开着, 任务栏能收起)
+      const 代 = $('#agent-dock');
+      if (代) {
+        const 位 = 代.querySelector('.ag-host') || 代;
+        位.appendChild(el);
+        代.classList.add('in');
+      }
+      continue;
+    }
+    // 别的有界面的块(AI 配置、次元口袋…): 开一个窗, 把它的页搬进去
+    窗.开('block:' + id, { 题: (块.icon || '▪') + ' ' + (块.name || id), 宽: 560, 高: 480,
+      内容: 身 => 身.appendChild(el) });
+  }
+};
 // ══════════ 装配 ══════════
 (async () => {
   await 应用.载();
   if (ctx.root) {
+    ctx.root.style.display = 'none';       // 桌面的界面直接画在 body 上, 这个根空着不用
     // 桌面画不上不耽误能力(ui.state/ui.do/apps.* 照常)
     try {
       桌面.画();
@@ -2755,6 +2813,9 @@ ctx.provide('ui.host', () => true, { desc: '本块在跑: 有桌面(内核因此
         await 开孢子(a.id);
       });
       ctx.on('mycelium:apps', 任务栏);
+      // 收编: 先收已在场的(ai/agent), 之后块变了(新装、被替换)再收
+      收编().catch(e => ctx.log('收编没成:', e.message));
+      ctx.on('mycelium:blocks', () => { 收编().catch(() => { }); });
     } catch (e) { ctx.log('桌面没画出来(能力照常用):', e.message); }
   }
 })();
@@ -2776,6 +2837,8 @@ return {};
 //   真要绕过(比如整库搬迁)用 data.clean {key, force: true}。删人的东西前三思, 删了回不来(除非有快照)。
 // 【连电脑文件夹】用户要把某个文件夹接进来时: pocket.pickFolder 让用户亲手选(浏览器要求必须人点),
 //   之后 disk:<文件夹名>/<路径> 就是那个文件夹里的文件, data.get/list 照常用, data.set 写回去。
+// ══════════ 基础 ══════════
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
 // ══════════ 归属 ══════════
 // 谁的前缀谁管: 各块在「自报」段里写 数据 {prefix…}, 最长的前缀算数。写了 edit 的前缀,
 // 只有主人(或没有主人在跑)能经口袋写。两块认同一个前缀: 谁都不能经口袋写(说清是谁)。

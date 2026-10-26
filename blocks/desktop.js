@@ -124,6 +124,7 @@ function 任务栏() {
   栏.innerHTML = [...UI.apps.values()].map(a =>
     `<button class="u-dock" data-app="${esc(a.id)}" title="${esc(a.name)}">${a.icon || '📦'}</button>`).join('')
     + `<span class="u-dsp"></span>`
+    + `<button class="u-dock" data-act="agent" title="全能 agent 对话栏">💬</button>`
     + ['设置', '口袋', '示波器', '模型'].map(k =>
       `<button class="u-dock" data-win="${k}" title="${k}">${k === '设置' ? '⚙' : k === '口袋' ? '🎒' : k === '示波器' ? '📈' : '🧠'}</button>`).join('');
 }
@@ -258,9 +259,16 @@ const 桌面 = {
 .u-muted{color:var(--text-muted);font-size:11px}
 #pick-tip{position:fixed;left:12px;bottom:56px;background:var(--warn);color:#1a1a1a;font-size:12px;
   padding:6px 12px;border-radius:8px;z-index:200}
-#agent-dock{position:fixed;right:12px;bottom:52px;width:380px;height:480px;background:var(--bg-2);
-  border:1px solid var(--border);border-radius:var(--radius);z-index:90;display:none;flex-direction:column;overflow:hidden}
-#agent-dock.in{display:flex}`,
+#agent-dock{position:fixed;right:12px;bottom:56px;width:380px;height:480px;background:var(--bg-2);
+  border:1px solid var(--border);border-radius:var(--radius);z-index:90;display:none;flex-direction:column;overflow:hidden;
+  box-shadow:0 12px 40px rgba(0,0,0,.5)}
+#agent-dock.in{display:flex}
+#agent-dock .ag-bar{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--surface);
+  border-bottom:1px solid var(--border);font-size:12px;font-weight:600;cursor:move;user-select:none}
+#agent-dock .ag-bar .sp{flex:1}
+#agent-dock .ag-bar button{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:2px 7px;border-radius:4px}
+#agent-dock .ag-bar button:hover{background:var(--surface-hover);color:var(--text)}
+#agent-dock .ag-host{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}`,
   画() {
     const 样式 = document.createElement('style');
     样式.textContent = 桌面.样式;
@@ -274,7 +282,13 @@ const 桌面 = {
     document.body.appendChild(坞);
     const 代 = document.createElement('div');
     代.id = 'agent-dock';
+    代.innerHTML = `<div class="ag-bar">🤖 全能 agent<span class="sp"></span>
+<button data-a="min" title="收起">–</button></div><div class="ag-host"></div>`;
     document.body.appendChild(代);
+    听(代, 'click', e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      if (钮.dataset.a === 'min') 代.classList.remove('in');
+    });
     ctx.cleanup(() => { 桌.remove(); 坞.remove(); 代.remove(); 样式.remove(); });
     // 桌面点选: 点中的元素连选择器一起进卡片
     听(桌, 'click', e => {
@@ -290,8 +304,13 @@ const 桌面 = {
     听(坞, 'click', e => {
       const 钮 = e.target.closest('button'); if (!钮) return;
       if (钮.dataset.app) 开孢子(钮.dataset.app).catch(err => alert(err.message));
-      if (钮.dataset.win) {
+      if (钮.dataset.act === 'agent') {
+        const 代 = $('#agent-dock');
+        if (代) 代.classList.toggle('in');
+      }      if (钮.dataset.win) {
         const k = 钮.dataset.win;
+        // 口袋块自己开着窗(收编开的)就直接前置, 不重复挂一份
+        if (k === '口袋' && UI.wins.has('block:pocket')) { 窗.前置('block:pocket'); return; }
         if (UI.wins.has(k)) 窗.前置(k);
         else 窗.开(k, { 题: k, 宽: k === '设置' ? 620 : 480, 高: 460, 内容: 内置[k] });
       }
@@ -342,10 +361,40 @@ ctx.provide('apps.open', a => 开孢子(a.id).then(() => ({ ok: true })), { desc
 ctx.provide('apps.update', a => 应用.改(a.id, a.html).then(() => ({ ok: true })), { desc: '改一个小应用的代码',
   schema: { id: { type: 'string' }, html: { type: 'string' } } });
 ctx.provide('ui.host', () => true, { desc: '本块在跑: 有桌面(内核因此不挂兜底面板)', schema: {} });
+// ══════════ 收编 ══════════
+// 桌面是布局的唯一主人: 别的块的界面(ctx.root)本来在页面上流式堆着, 会被 #desk 盖住——
+// 把它们收进该去的地方: agent → 右下对话栏; 别的块 → 各自的窗。块后装/被替换都会再收一次。
+const 收编 = async () => {
+  const 根们 = [...document.querySelectorAll('#mycelium-root > [data-nodule-id]')];
+  if (!根们.length) return;
+  let 名 = {};
+  try { 名 = Object.fromEntries((await ctx.call('hypha.nodules')).map(b => [b.id, b])); } catch (e) { }
+  for (const el of 根们) {
+    const id = el.dataset.noduleId;
+    if (id === 'desktop' || el.dataset.已收编) continue;
+    el.dataset.已收编 = '1';
+    const 块 = 名[id] || {};
+    el.style.height = '100%';
+    if (id === 'agent') {
+      // 全能 agent: 右下常驻对话栏(默认开着, 任务栏能收起)
+      const 代 = $('#agent-dock');
+      if (代) {
+        const 位 = 代.querySelector('.ag-host') || 代;
+        位.appendChild(el);
+        代.classList.add('in');
+      }
+      continue;
+    }
+    // 别的有界面的块(AI 配置、次元口袋…): 开一个窗, 把它的页搬进去
+    窗.开('block:' + id, { 题: (块.icon || '▪') + ' ' + (块.name || id), 宽: 560, 高: 480,
+      内容: 身 => 身.appendChild(el) });
+  }
+};
 // ══════════ 装配 ══════════
 (async () => {
   await 应用.载();
   if (ctx.root) {
+    ctx.root.style.display = 'none';       // 桌面的界面直接画在 body 上, 这个根空着不用
     // 桌面画不上不耽误能力(ui.state/ui.do/apps.* 照常)
     try {
       桌面.画();
@@ -360,6 +409,9 @@ ctx.provide('ui.host', () => true, { desc: '本块在跑: 有桌面(内核因此
         await 开孢子(a.id);
       });
       ctx.on('mycelium:apps', 任务栏);
+      // 收编: 先收已在场的(ai/agent), 之后块变了(新装、被替换)再收
+      收编().catch(e => ctx.log('收编没成:', e.message));
+      ctx.on('mycelium:blocks', () => { 收编().catch(() => { }); });
     } catch (e) { ctx.log('桌面没画出来(能力照常用):', e.message); }
   }
 })();

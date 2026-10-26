@@ -623,6 +623,8 @@
   const assembleAll = async () => {
     L.booting = true; L.errors = {}; L.broken = [];
     L.factory = [];
+    // 上一次的兜底面板撤掉: 界面块可能回来了(它画在 mycelium-root 里, 会盖住块的界面)
+    if (doc()) doc().querySelectorAll('[data-k-panel]').forEach(el => el.remove());
     if (doc()) doc().querySelectorAll(`${SCR}[type="mycelium/nodule"]`).forEach(el => {
       try {
         const b = parseBlock(el.textContent);
@@ -1472,8 +1474,12 @@ ${b.broken || b.adopted || b.id === 'hypha' ? '' :
     },
   };
   P('hypha.panel', a => {
-    const host = a?.host?.appendChild ? a.host : doc().createElement('div');   // 同页调用可以直接给元素
-    if (!a?.host?.appendChild) (doc().getElementById('mycelium-root') || doc().body).appendChild(host);
+    let host = a?.host;
+    if (!host?.appendChild) {                     // 没给宿主: 自带一个壳(壳有标记, 重新装配时撤掉)
+      host = doc().createElement('div');
+      host.setAttribute('data-k-panel', '1');
+      (doc().getElementById('mycelium-root') || doc().body).appendChild(host);
+    }
     面板.画(host);
     return true;
   }, '把裸壳面板画进 host(桌面块的设置窗用它; 不给就画在页面根部)', { host: {} }, false);
@@ -1508,8 +1514,11 @@ ${b.broken || b.adopted || b.id === 'hypha' ? '' :
       if (Net.外) Net.外.expose('call', a2 => Net.call(a2.path, a2.args));
       try { LS()?.setItem(BOOT.key + '.crash', '0'); } catch (_) { }
       if (doc() && !env.boot.headless && !Net.has('ui.host')) {   // 没有界面块: 内核兜底面板, 系统永远可操作
-        const host = doc().getElementById('mycelium-root') || doc().body;
-        面板.画(host);
+        const host = doc().getElementById('mycelium-root') || doc().body,
+          壳 = doc().createElement('div');
+        壳.setAttribute('data-k-panel', '1');       // 标记打在壳上(不是根): 重新装配时撤壳, 别动根
+        host.appendChild(壳);
+        面板.画(壳);
       }
     } catch (e) { banner('启动失败: ' + e.message); throw e; }
   };
