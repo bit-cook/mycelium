@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mycelium 菌丝体 — 一个文件就能跑的个人 AI 操作系统</title>
+<meta name="description" content="Mycelium: 双击即跑的个人 AI 操作系统。Hypha 内核 + Nodule 块 + Spore 小应用, 能力网三级权限, 整库快照, 源码可自修改。从 Colony 提炼设计, 单文件、零依赖、测试全绿。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧬</text></svg>">
+<style>
+/* ═══════════ 设计变量(与项目桌面块同源) ═══════════ */
+:root{color-scheme:dark;--bg:#0b0d10;--bg-2:#12151a;--bg-3:#171b21;
+--surface:rgba(255,255,255,.035);--surface-2:rgba(255,255,255,.06);
+--border:rgba(255,255,255,.09);--border-strong:rgba(255,255,255,.18);
+--text:#e8ecf0;--muted:#9aa4ad;--dim:#5c6570;
+--accent:#7ee787;--accent-2:#4cc9a0;--accent-soft:rgba(126,231,135,.12);
+--warn:#f5a623;--danger:#ff5757;--violet:#b48ef7;
+--mono:ui-monospace,"JetBrains Mono",SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+--maxw:1120px}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.75 var(--sans);
+-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:rgba(126,231,135,.28)}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+svg{display:block}
+
+/* ═══════════ 菌丝背景 ═══════════ */
+#net{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.5}
+@media (prefers-reduced-motion:reduce){#net{opacity:.28}}
+
+/* ═══════════ 导航 ═══════════ */
+.nav{position:fixed;top:0;left:0;right:0;z-index:100;backdrop-filter:blur(14px);
+background:rgba(11,13,16,.78);border-bottom:1px solid var(--border)}
+.nav .in{max-width:var(--maxw);margin:0 auto;padding:0 24px;height:58px;display:flex;align-items:center;gap:26px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15px;color:var(--text);white-space:nowrap}
+.brand:hover{text-decoration:none}
+.brand .em{font-size:19px}
+.brand small{color:var(--dim);font-weight:400;font-size:12px;margin-left:2px}
+.links{display:flex;gap:4px;margin-left:auto;overflow-x:auto;scrollbar-width:none}
+.links::-webkit-scrollbar{display:none}
+.links a{color:var(--muted);font-size:13px;padding:6px 11px;border-radius:7px;white-space:nowrap;transition:.15s}
+.links a:hover{color:var(--text);background:var(--surface);text-decoration:none}
+.links a.on{color:var(--accent);background:var(--accent-soft)}
+.gh{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--text);
+border:1px solid var(--border-strong);border-radius:8px;padding:6px 13px;white-space:nowrap;transition:.15s}
+.gh:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.gh svg{width:15px;height:15px;fill:currentColor}
+@media (max-width:760px){.links{display:none}.nav .in{gap:14px}}
+
+/* ═══════════ Hero ═══════════ */
+.hero{position:relative;z-index:1;padding:158px 0 90px;text-align:center}
+.hero .eye{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--accent);
+background:var(--accent-soft);border:1px solid rgba(126,231,135,.28);padding:5px 14px;border-radius:99px;margin-bottom:26px}
+.hero .eye .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 2.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.hero h1{font-size:clamp(38px,6.4vw,72px);line-height:1.12;margin:0 0 10px;letter-spacing:-.02em;font-weight:800}
+.hero h1 .g{background:linear-gradient(100deg,var(--accent) 10%,var(--accent-2) 55%,#6aa9ff);
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero .sub{font-size:clamp(17px,2.4vw,21px);color:var(--muted);max-width:760px;margin:14px auto 0;font-weight:400}
+.hero .sub b{color:var(--text);font-weight:600}
+.hero .cta{display:flex;gap:13px;justify-content:center;margin-top:38px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;font-size:14.5px;font-weight:600;border-radius:10px;
+padding:12px 24px;transition:.18s;border:1px solid transparent;cursor:pointer}
+.btn.p{background:var(--accent);color:#0a1410}
+.btn.p:hover{filter:brightness(1.12);transform:translateY(-1px);text-decoration:none}
+.btn.g{border-color:var(--border-strong);color:var(--text);background:var(--surface)}
+.btn.g:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px);text-decoration:none}
+.hero .meta{margin-top:44px;display:flex;gap:26px;justify-content:center;flex-wrap:wrap;
+font-size:13px;color:var(--dim);font-family:var(--mono)}
+.hero .meta b{color:var(--accent);font-weight:600}
+
+/* ═══════════ 章节骨架 ═══════════ */
+section{position:relative;z-index:1;padding:84px 0}
+section+section{border-top:1px solid var(--border)}
+.kick{font-family:var(--mono);font-size:12.5px;color:var(--accent);letter-spacing:.14em;margin-bottom:12px}
+h2{font-size:clamp(26px,3.6vw,38px);line-height:1.25;margin:0 0 14px;letter-spacing:-.015em;font-weight:750}
+.lead{color:var(--muted);font-size:16.5px;max-width:820px;margin:0 0 44px}
+.lead b{color:var(--text)}
+.rv{opacity:0;transform:translateY(22px);transition:opacity .7s ease,transform .7s ease}
+.rv.in{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.rv{opacity:1;transform:none;transition:none}}
+
+/* ═══════════ 启示卡片 ═══════════ */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(292px,1fr));gap:16px}
+.card{background:var(--bg-2);border:1px solid var(--border);border-radius:14px;padding:24px;transition:.2s;position:relative;overflow:hidden}
+.card:hover{border-color:var(--border-strong);transform:translateY(-2px)}
+.card .no{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.16em}
+.card h3{margin:10px 0 8px;font-size:17px;display:flex;align-items:center;gap:9px}
+.card p{margin:0;color:var(--muted);font-size:14px;line-height:1.7}
+.card .fx{margin-top:14px;padding-top:13px;border-top:1px dashed var(--border);font-size:13px;color:var(--muted)}
+.card .fx b{color:var(--accent);font-weight:600}
+
+/* ═══════════ 短板表 ═══════════ */
+.tbl{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+.tbl th,.tbl td{padding:13px 15px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+.tbl th{font-size:12px;color:var(--dim);font-weight:600;letter-spacing:.08em;font-family:var(--mono)}
+.tbl td:first-child{color:var(--muted);width:31%}
+.tbl td:nth-child(2){color:var(--dim);width:27%}
+.tbl td:last-child{color:var(--text)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl .ok{color:var(--accent);font-weight:600}
+.tbl b{color:var(--warn);font-weight:600;font-size:13px}
+
+/* ═══════════ 架构图 ═══════════ */
+.arch{background:var(--bg-2);border:1px solid var(--border);border-radius:16px;padding:34px 30px}
+.layer{display:grid;grid-template-columns:150px 1fr;gap:18px;align-items:center;padding:15px 18px;
+border:1px solid var(--border);border-radius:11px;background:var(--surface);margin-bottom:10px;transition:.2s}
+.layer:hover{border-color:var(--border-strong)}
+.layer:last-child{margin-bottom:0}
+.layer .nm{font-weight:700;font-size:14.5px;display:flex;align-items:center;gap:8px}
+.layer .nm .en{font-family:var(--mono);font-size:11px;color:var(--dim);font-weight:400}
+.layer .ds{font-size:13px;color:var(--muted);line-height:1.6}
+.layer .ds code{font-family:var(--mono);font-size:12px;color:var(--accent);background:var(--accent-soft);
+padding:1px 6px;border-radius:4px}
+.layer.l1{border-color:rgba(126,231,135,.3)}.layer.l1 .nm{color:var(--accent)}
+.layer.l2 .nm{color:#6aa9ff}.layer.l3 .nm{color:var(--violet)}
+.layer.l4 .nm{color:var(--warn)}.layer.l5 .nm{color:var(--muted)}
+@media (max-width:640px){.layer{grid-template-columns:1fr;gap:6px}}
+
+/* ═══════════ 演示 ═══════════ */
+.demo-bar{display:flex;align-items:center;gap:12px;background:var(--bg-3);border:1px solid var(--border);
+border-radius:12px 12px 0 0;padding:10px 16px;font-size:13px;flex-wrap:wrap}
+.demo-bar .lights{display:flex;gap:6px}
+.demo-bar .lights i{width:10px;height:10px;border-radius:50%;background:var(--border-strong)}
+.demo-bar .t{color:var(--muted);font-family:var(--mono);font-size:12px}
+.demo-bar .sp{flex:1}
+.demo-bar a{font-size:12.5px;color:var(--accent);white-space:nowrap}
+.demo-frame{width:100%;height:660px;border:1px solid var(--border);border-top:none;border-radius:0 0 12px 12px;background:var(--bg)}
+.demo-note{display:flex;gap:10px;align-items:flex-start;margin-top:14px;font-size:13px;color:var(--muted);
+background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px}
+.demo-note .ic{color:var(--accent);font-size:15px;line-height:1.5}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:26px 0 34px}
+.step{background:var(--bg-2);border:1px solid var(--border);border-radius:12px;padding:18px}
+.step .n{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:.14em;margin-bottom:7px}
+.step h4{margin:0 0 6px;font-size:14.5px}
+.step p{margin:0;font-size:13px;color:var(--muted);line-height:1.65}
+
+/* ═══════════ 代码/tabs ═══════════ */
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:0}
+.tab{font-family:var(--mono);font-size:12.5px;color:var(--muted);background:var(--surface);
+border:1px solid var(--border);border-bottom:none;border-radius:9px 9px 0 0;padding:9px 16px;cursor:pointer;transition:.15s}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--accent);background:var(--bg-2);border-color:var(--border-strong)}
+.codewrap{position:relative;background:var(--bg-2);border:1px solid var(--border-strong);border-radius:0 12px 12px 12px;overflow:hidden}
+.codewrap .cap{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);
+font-size:12px;color:var(--muted)}
+.codewrap .cap .f{font-family:var(--mono);color:var(--dim)}
+.copy{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--surface);
+border:1px solid var(--border);border-radius:6px;padding:3px 10px;cursor:pointer;transition:.15s}
+.copy:hover{color:var(--accent);border-color:var(--accent)}
+pre{margin:0;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.75;
+font-variant-ligatures:none}
+pre code{font:inherit}
+.c{color:var(--dim);font-style:italic}          /* 注释 */
+.s{color:#a8d98b}                                 /* 字符串 */
+.k{color:#f78fb3}                                 /* 关键字 */
+.n{color:#f5c97b}                                 /* 数字/符号 */
+.fn{color:#6aa9ff}                                /* 函数名 */
+.seg-h{color:var(--accent);font-weight:700}       /* 段头 */
+.scp{color:var(--warn);font-weight:700}           /* 范围 */
+.bor{color:var(--violet);font-weight:700}         /* 借用 */
+
+/* ═══════════ Playground ═══════════ */
+.pg{display:grid;grid-template-columns:1fr 1fr;gap:0;border:1px solid var(--border-strong);border-radius:14px;overflow:hidden;background:var(--bg-2)}
+.pg .side{padding:0}
+.pg .side+.side{border-left:1px solid var(--border)}
+.pg .hd{padding:11px 16px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted);
+font-family:var(--mono);display:flex;align-items:center;gap:10px}
+.pg .hd b{color:var(--accent);font-weight:600}
+.pg textarea{width:100%;height:340px;background:transparent;border:none;color:var(--text);
+font-family:var(--mono);font-size:12.5px;line-height:1.8;padding:16px;resize:vertical;outline:none;tab-size:2}
+.pg .out{height:340px;overflow:auto;padding:16px;font-family:var(--mono);font-size:12.5px;line-height:1.8;white-space:pre-wrap}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 0;font-size:12px;color:var(--muted);font-family:var(--mono)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.i-seg{background:var(--accent)}.i-scp{background:var(--warn)}.i-bor{background:var(--violet)}
+.pg .out .l{padding:1px 8px;border-radius:4px;border-left:3px solid transparent}
+.pg .out .l.seg{background:rgba(126,231,135,.08);border-left-color:var(--accent)}
+.pg .out .l.scp{background:rgba(245,166,35,.07);border-left-color:var(--warn)}
+.pg .out .l.bor{background:rgba(180,142,247,.08);border-left-color:var(--violet)}
+.pg .out .l.plain{color:var(--muted)}
+@media (max-width:860px){.pg{grid-template-columns:1fr}.pg .side+.side{border-left:none;border-top:1px solid var(--border)}}
+
+/* ═══════════ 测试 ═══════════ */
+.tests{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.test{display:flex;gap:13px;align-items:flex-start;background:var(--bg-2);border:1px solid var(--border);
+border-radius:11px;padding:16px 18px}
+.test .ck{color:var(--accent);font-weight:700;font-size:15px;line-height:1.6}
+.test .nm{font-family:var(--mono);font-size:13px;color:var(--text)}
+.test .ds{font-size:12.5px;color:var(--muted);margin-top:3px;line-height:1.6}
+.term{margin-top:26px;background:#0a0c0f;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.term .bar{display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.term .bar i{width:10px;height:10px;border-radius:50%;background:var(--border-strong)}
+.term pre{padding:16px 20px;font-size:12.5px;line-height:1.9}
+.term .p{color:var(--accent)}
+.term .c2{color:var(--dim)}
+
+/* ═══════════ 路线图 ═══════════ */
+.road{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.rm{background:var(--bg-2);border:1px solid var(--border);border-radius:12px;padding:20px}
+.rm .v{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:.1em}
+.rm h4{margin:8px 0 8px;font-size:15px}
+.rm ul{margin:0;padding-left:18px;color:var(--muted);font-size:13px;line-height:1.9}
+.rm.done{border-color:rgba(126,231,135,.35)}
+.rm.done .v::after{content:" · 已发布";color:var(--accent)}
+
+/* ═══════════ 页脚 ═══════════ */
+footer{position:relative;z-index:1;border-top:1px solid var(--border);padding:52px 0 40px;color:var(--muted);font-size:13.5px}
+footer .grid{display:flex;gap:40px;justify-content:space-between;flex-wrap:wrap}
+footer .col h5{margin:0 0 10px;color:var(--text);font-size:13px;font-family:var(--mono);letter-spacing:.1em}
+footer .col a{display:block;color:var(--muted);padding:3px 0}
+footer .col a:hover{color:var(--accent)}
+footer .bot{margin-top:34px;padding-top:22px;border-top:1px solid var(--border);display:flex;
+justify-content:space-between;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
+</style>
+</head>
+<body>
+
+<canvas id="net"></canvas>
+
+<nav class="nav">
+  <div class="in">
+    <a class="brand" href="#top"><span class="em">🧬</span>Mycelium<small>菌丝体</small></a>
+    <div class="links" id="links">
+      <a href="#insight">启示</a><a href="#arch">架构</a><a href="#demo">演示</a>
+      <a href="#mech">机制</a><a href="#vs">对照</a><a href="#tests">测试</a><a href="#road">路线图</a>
+    </div>
+    <a class="gh" href="https://github.com/bit-cook/mycelium" target="_blank" rel="noopener">
+      <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.05-.13-.36-.95.08-1.98 0 0 .67-.21 2.2.82.63-.18 1.31-.27 1.98-.27.67 0 1.35.09 1.98.27 1.53-1.04 2.2-.82 2.2-.82.44 1.03.13 1.85.08 1.98.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub</a>
+  </div>
+</nav>
+
+<!-- ═══════════ Hero ═══════════ -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="eye"><span class="dot"></span>单文件 · 零依赖 · 源码可自修改 · 测试全绿</div>
+    <h1>一个文件，<br>就是一个<span class="g">个人 AI 操作系统</span></h1>
+    <p class="sub">Mycelium 是一个 <b>163KB 的 HTML 文件</b>：双击即跑，不需要安装、不需要构建、不需要服务器。
+      内核 <b>Hypha</b> + 块 <b>Nodule</b> + 小应用 <b>Spore</b>，能力网连起一切——
+      <b>agent 能读改全部源码，而每一步都在你的审批之下</b>。</p>
+    <div class="cta">
+      <a class="btn p" href="#demo">▶ 在线试试真身</a>
+      <a class="btn g" href="https://github.com/bit-cook/mycelium" target="_blank" rel="noopener">在 GitHub 上查看源码</a>
+    </div>
+    <div class="meta">
+      <span><b>1,609</b> 行内核</span><span><b>4</b> 个块</span><span><b>46</b> 个能力</span>
+      <span><b>5</b> 套测试全绿</span><span><b>0</b> 个依赖</span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════ 启示 ═══════════ -->
+<section id="insight">
+  <div class="wrap">
+    <div class="kick rv">01 · 启示</div>
+    <h2 class="rv">从 Colony 提炼的，不止是功能</h2>
+    <p class="lead rv">Mycelium 的源头是 <a href="https://github.com/520xiaomumu/colony" target="_blank" rel="noopener">Colony</a>——
+      一个 18,736 行的单文件个人 AI 系统。深入读源码后，真正值钱的不是它的功能清单，而是这几条设计：</p>
+    <div class="cards">
+      <div class="card rv"><div class="no">INSIGHT 01</div>
+        <h3>🧩 代码即数据</h3>
+        <p>段头、借用行、范围标记都是<strong>注释协议</strong>：代码结构因此可被程序理解、局部修改、按名单剪裁。一个 200 行的段解析器，胜过一整套构建框架。</p>
+        <div class="fx">→ Mycelium 继承并强化：<b>门禁</b>保证"拆开再拼回一字不差"</div></div>
+      <div class="card rv"><div class="no">INSIGHT 02</div>
+        <h3>🛡 改得有纪律</h3>
+        <p>可自修改系统的安全不来自"不让改"，而来自唯一写入口：精确替换、基线号防覆盖、语法不过不落库、初始化失败自动回滚。</p>
+        <div class="fx">→ 再加上 <b>guarded 审批</b>：改代码这类事，人点头才做</div></div>
+      <div class="card rv"><div class="no">INSIGHT 03</div>
+        <h3>🔍 对 agent 透明到底</h3>
+        <p>agent 的系统提示就是一段可改代码；块用「自报/技能」段向 agent 自我介绍；"用户就是开发者，有权看你的一切"写死在规矩里。</p>
+        <div class="fx">→ Mycelium 的 agent 提示词<b>可读、可改、可换回</b></div></div>
+      <div class="card rv"><div class="no">INSIGHT 04</div>
+        <h3>🧪 哑管道原则</h3>
+        <p>不可迭代的部分压到最小，可迭代的放在能热更新的层。Colony 的浏览器扩展装一次不用动，逻辑全在网页侧。</p>
+        <div class="fx">→ Mycelium 的启动器是全文件<b>唯一物理不可改</b>的代码</div></div>
+      <div class="card rv"><div class="no">INSIGHT 05</div>
+        <h3>📦 单文件自包含</h3>
+        <p>file:// 双击即跑，数据在本地，导出/导入搬运。个人软件的终点不是应用商店，是一个文件。</p>
+        <div class="fx">→ 这个网站就运行着它：<b>下面的演示就是真身</b></div></div>
+      <div class="card rv"><div class="no">短板 → 补法</div>
+        <h3>🔧 工程化全面推进</h3>
+        <p>18,736 行单文件不可维护、零测试、改代码无审批、只能单块回滚、无可观测性——这些是 Colony 真实的短板。</p>
+        <div class="fx">→ Mycelium：<b>多文件开发 · 5 套测试 · 三级权限 · 整库快照 · tracing</b></div></div>
+    </div>
+    <div class="tbl-wrap rv" style="margin-top:34px;background:var(--bg-2);border:1px solid var(--border);border-radius:14px;padding:8px 6px">
+      <table class="tbl">
+        <tr><th>COLONY 的短板</th><th>后果</th><th class="ok">MYCELIUM 的做法</th></tr>
+        <tr><td>18,736 行单文件</td><td>git diff 灾难，人类不可维护</td><td>多文件开发态 + 单文件发布态（<code>node mycelium.js build</code>）</td></tr>
+        <tr><td>零测试</td><td>改内核全靠胆量</td><td>内置测试框架：内核跑在 node 里，5 套 + 冒烟全绿</td></tr>
+        <tr><td>agent 改代码无审批</td><td>一步错全盘皆输</td><td>能力三级权限 open/notice/guarded + 审批队列 + 自主度</td></tr>
+        <tr><td>只能单块回滚</td><td>连锁改坏救不回来</td><td>整库快照/恢复/分叉（<code>hypha.snapshot</code>）</td></tr>
+        <tr><td>无可观测性</td><td>只有 console</td><td>每次能力调用一条 span + 事件日志 journal</td></tr>
+        <tr><td>契约是字符串 DSL</td><td>难校验、难生成</td><td>形状三态 + 内置校验器，调用前挡错</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ 架构 ═══════════ -->
+<section id="arch">
+  <div class="wrap">
+    <div class="kick rv">02 · 架构</div>
+    <h2 class="rv">五层，每层只做一件事</h2>
+    <p class="lead rv">命名全部换新，意象自洽：Colony 是<b>菌群</b>（有蜂后、有中心），Mycelium 是<b>菌丝体</b>——地下的去中心化网络，每个节点既是生产者也是消费者。</p>
+    <div class="arch rv">
+      <div class="layer l1"><div class="nm">🧫 Spore <span class="en">孢子</span></div>
+        <div class="ds">小应用：一段 HTML，<code>iframe</code> 沙箱里跑，握手后才算就绪。可导出成离体文件，落在别处也能萌发。经 <code>mycelium.call</code> 调宿主能力。</div></div>
+      <div class="layer l2"><div class="nm">🟢 Nodule <span class="en">菌核</span></div>
+        <div class="ds">块：ai（多厂商协议适配）· agent（工具循环）· desktop（桌面/窗口）· pocket（数据守卫）。源码可改、可导入导出、坏一块不拖垮全部。</div></div>
+      <div class="layer l3"><div class="nm">🕸 the Net <span class="en">菌网</span></div>
+        <div class="ds">能力网：块/孢子/agent 之间唯一的交互协议。形状契约 + 三级权限（<code>open</code> 直接跑 / <code>notice</code> 广播 / <code>guarded</code> 要人批准）+ 每次调用一条 span。</div></div>
+      <div class="layer l4"><div class="nm">🧬 Hypha <span class="en">菌丝 · 内核</span></div>
+        <div class="ds">段/范围/借用解析、装载容错、改块（唯一写入口）、收养、导出（门禁）、隔离窗。内核自己也是"一块"：可改、可回滚、可导出。</div></div>
+      <div class="layer l5"><div class="nm">🪵 Substrate <span class="en">基质</span></div>
+        <div class="ds">IndexedDB（打不开退内存）+ 事件日志 journal（谁在什么时候写了什么）+ 整库快照 snapshot。</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ 演示 ═══════════ -->
+<section id="demo">
+  <div class="wrap">
+    <div class="kick rv">03 · 演示</div>
+    <h2 class="rv">下面跑的就是真身</h2>
+    <p class="lead rv">这不是截图，不是视频——是托管在本站的 <b>mycelium.html</b> 原样跑在 iframe 里。
+      你的所有操作和数据都只存在这个浏览器标签里（IndexedDB），刷新不丢，关掉即散。</p>
+    <div class="steps rv">
+      <div class="step"><div class="n">STEP 01</div><h4>接一个大脑</h4><p>桌面右下 ⚙ 设置 → 🧠 AI 配置：OpenAI 兼容的填 endpoint + key；本地 Ollama 填 <code>http://127.0.0.1:11434/v1</code>，key 留空。</p></div>
+      <div class="step"><div class="n">STEP 02</div><h4>对 agent 说话</h4><p>右下角对话栏直接说"看看桌面上有什么"。它调 <code>ui.state</code>、读块源码、改代码——改之前会弹审批。</p></div>
+      <div class="step"><div class="n">STEP 03</div><h4>拖一个孢子</h4><p>把 <a href="notes.html" target="_blank">notes.html（便签孢子）</a> 拖到桌面上，它就在隔离窗里跑，能经 <code>data.set</code存 进系统。</p></div>
+      <div class="step"><div class="n">STEP 04</div><h4>导出整个系统</h4><p>设置里「导出整个系统」得到一个全新的单文件——带着你的块改版和数据，发给别人双击即用。</p></div>
+    </div>
+    <div class="rv">
+      <div class="demo-bar">
+        <span class="lights"><i></i><i></i><i></i></span>
+        <span class="t">mycelium.html — 运行中</span>
+        <span class="sp"></span>
+        <a href="mycelium.html" target="_blank" rel="noopener">↗ 新窗口全屏打开</a>
+      </div>
+      <iframe class="demo-frame" src="mycelium.html" title="Mycelium 在线演示" loading="lazy"></iframe>
+      <div class="demo-note"><span class="ic">💡</span><span>演示环境没有配置 AI 厂商，agent 会说"还没配厂商"——配好后（或本地有 Ollama）它才醒。
+        想完整体验：<a href="https://github.com/bit-cook/mycelium" target="_blank" rel="noopener">下载 mycelium.html</a> 双击运行，数据就在你本机。</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ 机制 ═══════════ -->
+<section id="mech">
+  <div class="wrap">
+    <div class="kick rv">04 · 机制</div>
+    <h2 class="rv">注释，就是接口</h2>
+    <p class="lead rv">块的代码结构由三种注释标记定义——人和程序都读得懂。这就是"代码即数据"的全部秘密：</p>
+
+    <div class="tabs rv" id="tabs">
+      <button class="tab on" data-t="seg">段 · 一行一归属</button>
+      <button class="tab" data-t="scope">范围 · 可跨段</button>
+      <button class="tab" data-t="borrow">借用 · 懒取值</button>
+      <button class="tab" data-t="cap">能力 · 契约</button>
+      <button class="tab" data-t="edit">改块 · 有纪律</button>
+      <button class="tab" data-t="export">导出 · 门禁</button>
+    </div>
+    <div class="codewrap rv" id="codewrap">
+      <div class="cap"><span id="cap-file" class="f">blocks/ai.js</span><span id="cap-desc"></span>
+        <button class="copy" id="copy">复制</button></div>
+      <pre><code id="code"></code></pre>
+    </div>
+
+    <!-- Playground -->
+    <h3 class="rv" style="margin:64px 0 6px;font-size:22px">🎛 亲手玩：段解析器</h3>
+    <p class="lead rv" style="margin-bottom:22px">内核的段解析器就在页面里跑着一个迷你版——左边改，右边实时看出段、范围、借用。试试加一行 <code>// ═ 新段 ═</code>，或者把一个范围改成不闭合：</p>
+    <div class="pg rv">
+      <div class="side">
+        <div class="hd">✏️ 代码 <b>（可编辑）</b></div>
+        <textarea id="pg-in" spellcheck="false"></textarea>
+      </div>
+      <div class="side">
+        <div class="hd">🧬 解析结果 <b id="pg-stat"></b></div>
+        <div class="out" id="pg-out"></div>
+      </div>
+    </div>
+    <div class="legend rv">
+      <span><i class="i-seg"></i>段头（管到下一段头）</span>
+      <span><i class="i-scp"></i>范围头/尾（可跨段、嵌套）</span>
+      <span><i class="i-bor"></i>借用行（懒取值代理）</span>
+      <span>一行代码必属于且只属于一段</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ 对照 ═══════════ -->
+<section id="vs">
+  <div class="wrap">
+    <div class="kick rv">05 · 对照</div>
+    <h2 class="rv">与 Colony 的正面对照</h2>
+    <p class="lead rv">同样的单文件哲学，不同的工程完成度：</p>
+    <div class="rv" style="background:var(--bg-2);border:1px solid var(--border);border-radius:14px;padding:8px 6px">
+      <table class="tbl">
+        <tr><th></th><th>COLONY</th><th class="ok">MYCELIUM</th></tr>
+        <tr><td>分发</td><td>单文件（1.2MB / 18,736 行）</td><td>单文件（163KB / 4 块）+ 多文件开发态</td></tr>
+        <tr><td>内核可改</td><td>可改（localStorage 存改版）</td><td>可改 + 连续崩溃自动回滚原版 + 安全模式</td></tr>
+        <tr><td>权限</td><td>frames 标记（粗）</td><td>三级权限 + 审批队列 + 自主度三档</td></tr>
+        <tr><td>数据安全</td><td>单块回滚</td><td>整库快照/恢复 + 归属守卫 + journal 审计</td></tr>
+        <tr><td>测试</td><td>无</td><td>5 套 + 冒烟（内核跑在 node 里）</td></tr>
+        <tr><td>可观测</td><td>console ring</td><td>span tracing + 示波器窗 + journal</td></tr>
+        <tr><td>离体导出</td><td>从真内核精确剪（组合难预料）</td><td>专门的离体运行时（可预测、可测试）</td></tr>
+        <tr><td>契约</td><td>字符串 DSL</td><td>三态形状 + 校验器（缺参/多字段/类型）</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ 测试 ═══════════ -->
+<section id="tests">
+  <div class="wrap">
+    <div class="kick rv">06 · 质量</div>
+    <h2 class="rv">测试全绿，才敢说"完善"</h2>
+    <p class="lead rv">测试框架把内核跑在 node 里（内存基质 + 假 DOM + 桩能力 + 可审批 + 可导出）——块不需要浏览器就能测全链路。开发过程中它真抓住了 12 个 bug。</p>
+    <div class="tests rv">
+      <div class="test"><span class="ck">✓</span><div><div class="nm">hypha.spec.js</div><div class="ds">段解析 / 装载 / 借用（懒取值·停用剪一份）/ 改块（预览·基线号·回滚）/ 快照 / 审批 / trace / journal</div></div></div>
+      <div class="test"><span class="ck">✓</span><div><div class="nm">agent.spec.js</div><div class="ds">工具循环（要工具→执行→回灌→再请求）/ 重试退避 / 压缩接力 / 系统提示可改</div></div></div>
+      <div class="test"><span class="ck">✓</span><div><div class="nm">export.spec.js</div><div class="ds">导出门禁 / 借用剪成带指纹的复制 / 认亲换回 / 分叉检测 / 离体导出往返</div></div></div>
+      <div class="test"><span class="ck">✓</span><div><div class="nm">data.spec.js</div><div class="ds">数据读写 / 归属守卫（谁的前缀谁管）/ 硬删要 force / 块记录禁直接写</div></div></div>
+      <div class="test"><span class="ck">✓</span><div><div class="nm">selfmod.spec.js</div><div class="ds">自修改闭环：读段 → preview → replace → 验证行为 → 恢复出厂 → 全程留痕</div></div></div>
+      <div class="test"><span class="ck">✓</span><div><div class="nm">smoke.js</div><div class="ds">单文件在模拟浏览器里完整装载：4/4 块在跑、46 个能力、导出通过</div></div></div>
+    </div>
+    <div class="term rv"><div class="bar"><i></i><i></i><i></i></div>
+<pre><code><span class="c2">$</span> <span class="p">git clone</span> https://github.com/bit-cook/mycelium.git &amp;&amp; cd mycelium
+<span class="c2">$</span> <span class="p">node mycelium.js</span> build     <span class="c2"># 多文件 → mycelium.html（163KB，双击即用）</span>
+<span class="c2">$</span> <span class="p">node mycelium.js</span> test      <span class="c2"># 5 套测试 + 冒烟</span>
+
+✓ hypha.spec.js   段解析/装载/借用/改块/快照/审批/trace/journal
+✓ agent.spec.js   工具循环/重试/压缩接力/系统提示可改
+✓ export.spec.js  导出门禁/剪复制/认亲换回/分叉检测/离体导出
+✓ data.spec.js    数据读写/归属守卫
+✓ selfmod.spec.js 自修改闭环: 读段→preview→replace→验证→恢复出厂
+✓ smoke           单文件完整装载: 块 4/4 在跑, 能力 46, 导出 142132 字节
+
+5 过, 0 败</code></pre></div>
+  </div>
+</section>
+
+<!-- ═══════════ 路线图 ═══════════ -->
+<section id="road">
+  <div class="wrap">
+    <div class="kick rv">07 · 路线图</div>
+    <h2 class="rv">菌丝还要往哪长</h2>
+    <div class="road rv">
+      <div class="rm done"><div class="v">V0.1 · 现在</div><h4>地基</h4>
+        <ul><li>Hypha 内核 + 4 块 + 示例孢子</li><li>三级权限 / 审批 / 快照 / tracing</li><li>5 套测试 + 冒烟全绿</li></ul></div>
+      <div class="rm"><div class="v">V0.2</div><h4>协作</h4>
+        <ul><li>多 agent 编排（任务图 + 黑板）</li><li>本地优先同步（CRDT）</li><li>工作流块（节点画布）</li></ul></div>
+      <div class="rm"><div class="v">V0.3</div><h4>生态</h4>
+        <ul><li>块签名与信任级别</li><li>孢子市场（导出即分享）</li><li>语音 / 通话</li></ul></div>
+      <div class="rm"><div class="v">V0.4</div><h4>破土</h4>
+        <ul><li>跨设备虫洞（同一文件，多处萌发）</li><li>开放能力 SDK（别的语言写块）</li><li>插件市场与一键装配</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="grid">
+      <div class="col">
+        <h5>🧬 MYCELIUM</h5>
+        <div style="max-width:300px">一个文件就能跑的个人 AI 操作系统。MIT 许可，数据永远在你自己手里。</div>
+      </div>
+      <div class="col"><h5>项目</h5>
+        <a href="https://github.com/bit-cook/mycelium" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a href="https://github.com/bit-cook/mycelium#readme" target="_blank" rel="noopener">README</a>
+        <a href="https://github.com/bit-cook/mycelium/blob/main/DESIGN.md" target="_blank" rel="noopener">设计文档</a></div>
+      <div class="col"><h5>试试</h5>
+        <a href="mycelium.html" target="_blank">在线运行真身 ↗</a>
+        <a href="notes.html" target="_blank">便签孢子 ↗</a>
+        <a href="#demo">三步上手</a></div>
+      <div class="col"><h5>致敬</h5>
+        <a href="https://github.com/520xiaomumu/colony" target="_blank" rel="noopener">Colony（灵感来源）</a>
+      </div>
+    </div>
+    <div class="bot">
+      <span>© 2026 Mycelium contributors · MIT License</span>
+      <span>本站由 GitHub Pages 托管 · 静态、免费、无后端——和这个项目一样</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* ═══════════ 菌丝背景: 节点漂流, 靠近连线, 沿边送脉冲 ═══════════ */
+(function () {
+  var cv = document.getElementById('net'), ctx = cv.getContext('2d'), W, H, pts = [], N = 0;
+  var 少动 = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function 尺寸() {
+    var d = devicePixelRatio || 1;
+    W = cv.width = innerWidth * d; H = cv.height = innerHeight * d;
+    cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+    N = Math.min(90, Math.floor(innerWidth * innerHeight / 22000));
+    pts = [];
+    for (var i = 0; i < N; i++) pts.push({
+      x: Math.random() * innerWidth, y: Math.random() * innerHeight,
+      vx: (Math.random() - .5) * .22, vy: (Math.random() - .5) * .22,
+      r: Math.random() * 1.6 + .7, ph: Math.random() * Math.PI * 2
+    });
+  }
+  function 帧(t) {
+    ctx.clearRect(0, 0, innerWidth, innerHeight);
+    var i, j, a, b, d;
+    for (i = 0; i < N; i++) {
+      a = pts[i];
+      if (!少动) { a.x += a.vx; a.y += a.vy; a.ph += .008; }
+      if (a.x < 0 || a.x > innerWidth) a.vx *= -1;
+      if (a.y < 0 || a.y > innerHeight) a.vy *= -1;
+      for (j = i + 1; j < N; j++) {
+        b = pts[j];
+        d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d < 130) {
+          ctx.strokeStyle = 'rgba(126,231,135,' + (.1 * (1 - d / 130)).toFixed(3) + ')';
+          ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+      var 亮 = .3 + .25 * Math.sin(a.ph);
+      ctx.fillStyle = 'rgba(126,231,135,' + 亮.toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(a.x, a.y, a.r, 0, 7); ctx.fill();
+    }
+    if (!少动) requestAnimationFrame(帧);
+  }
+  尺寸(); addEventListener('resize', 尺寸);
+  if (少动) 帧(0); else requestAnimationFrame(帧);
+})();
+
+/* ═══════════ 滚动显现 + 导航高亮 ═══════════ */
+(function () {
+  var io = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+  }), { threshold: .12 });
+  document.querySelectorAll('.rv').forEach(el => io.observe(el));
+  var 节 = [...document.querySelectorAll('section[id]')], 链 = [...document.querySelectorAll('.links a')];
+  var io2 = new IntersectionObserver(es => es.forEach(e => {
+    if (!e.isIntersecting) return;
+    链.forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + e.target.id));
+  }), { rootMargin: '-40% 0px -55% 0px' });
+  节.forEach(s => io2.observe(s));
+})();
+
+/* ═══════════ 语法高亮(迷你) ═══════════ */
+function 高亮(码, 类) {
+  var s = 码.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // 行分类: 段头/范围/借用 整行一个类, 其余按 token
+  return s.split('\n').map(function (行) {
+    var t = 行.trim();
+    if (/^\/\/\s*[═]+\s*.*[═]+\s*$/.test(t)) return '<span class="l ' + (类.seg || 'seg-h') + '">' + 行 + '</span>';
+    if (/^\/\/\s*✂/.test(t)) return '<span class="l ' + (类.scp || 'scp') + '">' + 行 + '</span>';
+    if (/^\/\/\s*↦/.test(t)) return '<span class="l ' + (类.bor || 'bor') + '">' + 行 + '</span>';
+    return 行
+      .replace(/(\/\/.*)$/g, '<span class="c">$1</span>')
+      .replace(/('[^']*'|"[^"]*"|`[^`]*`)/g, '<span class="s">$1</span>')
+      .replace(/\b(const|let|var|function|return|async|await|if|else|for|of|new|throw|try|catch|class|export|import|from|true|false|null|undefined)\b/g, '<span class="k">$1</span>')
+      .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="n">$1</span>')
+      .replace(/([一-龥\w$]+)(?=\()/g, '<span class="fn">$1</span>');
+  }).join('\n');
+}
+
+/* ═══════════ 机制 tabs ═══════════ */
+var 代码库 = {
+seg: { f: 'blocks/ai.js · 段', d: '段头管到下一段头; 一行代码必属于且只属于一段', c:
+`// ══════════ 并发闸 ══════════
+// 每家同时在跑的请求有上限, 多的排队, 免得扇出几十个把额度打爆; 429 后 20 秒内降到 3
+const 并发闸 = {
+  桶: {},
+  async 占(p) {
+    const b = this.桶[p.id] = this.桶[p.id] || { 在跑: 0, 队: [], 降到: 0 };
+    const 满 = Math.max(1, +p.concurrency || 8),
+      上限 = () => Date.now() < b.降到 ? Math.min(3, 满) : 满;
+    while (b.在跑 >= 上限()) await new Promise(r => b.队.push(r));
+    b.在跑++;
+    return e => { b.在跑--; };
+  },
+};
+
+// ══════════ 协议适配 ══════════
+// 一种协议一行。绝大多数厂商走 openai-compatible; 形状完全不同的才加新协议
+const 协议 = { 'openai-compatible': { /* … */ } };` },
+scope: { f: 'blocks/ai.js · 范围', d: '可跨段、嵌套、交叉; 剪段时被圈的代码跟着走', c:
+`// ══════════ 基础 ══════════
+async function 网络请求(url, opt = {}) {
+  let 真 = url, 经 = '';
+  // ✂ 转发 · 要: 网络请求
+  // 填了就经它转(浏览器不让网页直连时用), {url} 换成编码后的原网址
+  const 转 = opt.转发;
+  if (转) [真, 经] = [(转.includes('{url}') ? 转 : 转 + '{url}')
+    .replace('{url}', encodeURIComponent(url)), \`(经 \${转})\`];
+  // ✂ 转发 完
+  for (let i = 0; i <= 3; i++) { /* 超时不重发: 厂商可能已在算 */ }
+}
+
+// ✂ 离体时不带 · 号: a
+// 孢子导出(离体)不留的代码: 整块搬去没有内核的地方才用
+// ✂ 离体时不带 完` },
+borrow: { f: 'blocks/desktop.js · 借用', d: '整段是另一个块的代码: 懒取值代理, 源头停用自动剪一份', c:
+`'use strict';
+// ↦ 借 hypha 的 离体运行时
+// ↦ 借 ai 的 选模型
+
+// ══════════ 内置窗 ══════════
+const 内置 = {
+  模型(身) {
+    // 借 ai 块的选模型小表: ai 不在跑时, 这份文件自带剪来的复制(照跑)
+    let 表;
+    try { 表 = 选模型; } catch (e) {
+      身.innerHTML = '选模型表要 ai 块在跑: ' + e.message;
+      return;
+    }
+    Promise.resolve(表.挂(身, { 题: '选模型' })).catch(() => {});
+  },
+};` },
+cap: { f: 'the Net · 能力', d: '块间唯一交互协议: 形状契约 + 三级权限 + 每次一条 span', c:
+`ctx.provide('ai.chat', async a => {
+  if (!Array.isArray(a.messages)?.length) throw new Error('要 messages 数组');
+  const p = await 厂商配置.选(a);
+  return a.stream ? 模型调用.chatStream(p, a) : 模型调用.chat(p, a);
+}, {
+  desc: '对话, 可带工具: 回 {content, toolCalls, usage}; stream 回异步迭代器',
+  schema: {                       // 契约: 缺参/多字段/类型错, 调用前就挡
+    messages: { type: 'array', description: '[{role, content}]' },
+    tools: { type: 'array' }, stream: { type: 'boolean' },
+    additionalProperties: false,
+  },
+  level: 'open',                  // open 直接跑 | notice 广播 | guarded 要人批准
+});
+
+await ctx.call('ai.chat', { messages: [{ role: 'user', content: '在吗' }] });` },
+edit: { f: 'hypha.setNodule · 改块', d: '唯一写入口: 精确、可预览、可回滚、要审批', c:
+`// 读段目录 → 读那段 → 先 preview 看改了哪些段 → 再真写
+const 目录 = await call('hypha.nodule', { id: 'agent' });
+const 段 = await call('hypha.nodule', { id: 'agent', segment: '系统提示' });
+
+await call('hypha.setNodule', {
+  id: 'agent',
+  expected: 目录.revision,        // 基线号: 对不上拒绝, 防并发覆盖
+  edits: [{
+    name: '系统提示',
+    replace: [{                   // 只换段里和 old 一字一差的那一处(比整段重写稳)
+      old: '你是 Mycelium 的全能 agent。',
+      new: '你是 Mycelium 的全能 agent(改过的规矩)。',
+    }],
+  }],
+  preview: true,                  // 只看不改: 回每段的改动和字节差
+});
+// 语法不过不落库; 初始化失败自动回滚旧版; guarded 能力要人点头` },
+export: { f: 'hypha.build · 导出', d: '门禁: 拆开再拼回一字不差、映射不悬空、语法过、血统对得上', c:
+`// 只导桌面: 它借的 ai「选模型」不在名单里 → 剪成带指纹的复制带走
+const html = await call('hypha.build', { ids: ['desktop'] });
+//   段头写成:  // ═ 选模型 · 源自: ai/选模型 · 指纹: 3f9a1c2b ═
+
+// 导进一个有 ai 的系统: 认亲——复制换回借用行; 分叉的保留复制, 不乱换
+await call('hypha.adopt', { text: html });
+
+// 离体导出(孢子): 块加一行 // ↦ 借 hypha 的 离体运行时 即可
+const solo = await call('hypha.build', { ids: ['desktop'], stem: false });` },
+};
+(function () {
+  var 码 = document.getElementById('code'), 显 = document.getElementById('cap-file'), 述 = document.getElementById('cap-desc');
+  function 选(k) {
+    var x = 代码库[k];
+    显.textContent = x.f; 述.textContent = x.d;
+    码.innerHTML = 高亮(x.c);
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.t === k));
+  }
+  document.getElementById('tabs').addEventListener('click', e => {
+    var t = e.target.closest('.tab'); if (t) 选(t.dataset.t);
+  });
+  document.getElementById('copy').addEventListener('click', function () {
+    var 钮 = this;
+    navigator.clipboard.writeText(码.textContent).then(() => {
+      钮.textContent = '已复制 ✓'; setTimeout(() => 钮.textContent = '复制', 1600);
+    }).catch(() => { 钮.textContent = '复制失败'; setTimeout(() => 钮.textContent = '复制', 1600); });
+  });
+  选('seg');
+})();
+
+/* ═══════════ Playground: 迷你段解析器(与内核同规则) ═══════════ */
+(function () {
+  var 例 = `// ═ 自报 ═
+// 一处配好厂商和模型, 各块的对话都经这里调
+
+// ═ 基础 ═
+const esc = s => String(s).replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+
+// ✂ 转发 · 要: 基础
+// 浏览器不让网页直连时, 经它转
+const 转 = opt.转发;
+// ✂ 转发 完
+
+// ═ 装配 ═
+ctx.provide('ai.chat', 对话, { level: 'open' });
+
+// ↦ 借 hypha 的 离体运行时`;
+  var 入 = document.getElementById('pg-in'), 出 = document.getElementById('pg-out'), 计 = document.getElementById('pg-stat');
+  var 段 = /^\/\/\s*[═]+\s*(.+?)\s*[═]+\s*$/, 借 = /^\/\/\s*↦\s*借\s+(\S+)\s+的\s+(.+)$/, 范 = /^\/\/\s*✂\s*(.+?)(\s+完)?\s*$/;
+  function 析() {
+    var 行s = 入.value.split('\n'), 段数 = 0, 借数 = 0, 未闭 = [], out = [], i, t, m;
+    for (i = 0; i < 行s.length; i++) {
+      t = 行s[i].trim(), m = null;
+      if ((m = 段.exec(t))) { 段数++; out.push('<div class="l seg">' + Esc(行s[i]) + ' <span style="opacity:.55">← 段「' + Esc(m[1]) + '」开头</span></div>'); continue; }
+      if ((m = 借.exec(t))) { 借数++; out.push('<div class="l bor">' + Esc(行s[i]) + ' <span style="opacity:.55">← 借 ' + Esc(m[1]) + '/' + Esc(m[2]) + '</span></div>'); continue; }
+      if ((m = 范.exec(t))) {
+        var 名 = m[1];
+        if (m[2]) { var k = 未闭.lastIndexOf(名); if (k < 0) out.push('<div class="l scp">' + Esc(行s[i]) + ' <span style="opacity:.55">← ✗ 前面没有开头</span></div>'); else { 未闭.splice(k, 1); out.push('<div class="l scp">' + Esc(行s[i]) + ' <span style="opacity:.55">← 闭合「' + Esc(名) + '」</span></div>'); } }
+        else { 未闭.push(名); out.push('<div class="l scp">' + Esc(行s[i]) + ' <span style="opacity:.55">← 范围「' + Esc(名) + '」开头</span></div>'); }
+        continue;
+      }
+      out.push('<div class="l plain">' + Esc(行s[i]) + '</div>');
+    }
+    var 尾 = 未闭.length ? ' · <span style="color:var(--warn)">✗ 「' + Esc(未闭.join('、')) + '」没收尾</span>' : '';
+    计.innerHTML = 段数 + ' 段 · ' + 借数 + ' 借用' + 尾;
+    出.innerHTML = out.join('');
+  }
+  function Esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  入.value = 例;
+  入.addEventListener('input', 析);
+  析();
+})();
+</script>
+</body>
+</html>
