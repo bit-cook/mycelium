@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>便签孢子</title>
+<style>
+  html,body{margin:0;height:100%;background:#12151a;color:#e8ecf0;
+    font:14px/1.6 -apple-system,"PingFang SC",sans-serif}
+  .pad{display:flex;flex-direction:column;height:100%;padding:14px;box-sizing:border-box}
+  textarea{flex:1;resize:none;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);
+    color:inherit;border-radius:10px;padding:12px;font:inherit}
+  .row{display:flex;gap:8px;align-items:center;margin-top:10px}
+  button{background:rgba(126,231,135,.12);border:1px solid rgba(126,231,135,.35);color:#7ee787;
+    border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px}
+  .host{color:#9aa4ad;font-size:11px;margin-top:8px}
+  .tip{color:#f5a623;font-size:11px}
+</style>
+</head>
+<body>
+<div class="pad">
+  <textarea id="t" placeholder="写点什么, 存在系统里(media:便签)…"></textarea>
+  <div class="row">
+    <button id="save">存</button>
+    <button id="load">读</button>
+    <span id="say" class="host"></span>
+  </div>
+  <div class="host" id="host">正在认宿主…</div>
+</div>
+<script>
+/* 孢子跑在隔离窗里: 没有 colony、读不到本机存储。
+   要东西经 window.mycelium.call 问宿主要(宿主给不了的会收到清楚的错);
+   离体导出(没有宿主)时退回内存, 照跑不崩。 */
+(function () {
+  var 内存 = '';
+  var 宿主 = null;
+  function 有宿主() { return !!(window.mycelium && window.mycelium.call); }
+  function 话(s) { document.getElementById('say').textContent = s; }
+  function 认宿主() {
+    var 宿 = document.getElementById('host');
+    if (!有宿主()) {
+      宿.innerHTML = '<span class="tip">离体运行: 没有宿主, 只在内存里存(刷新即失)</span>';
+      return;
+    }
+    window.mycelium.call('hypha.lineage', {}).then(function (lin) {
+      宿主 = lin;
+      宿.textContent = '宿主: Mycelium 血统 ' + lin.id + (lin.solo ? '(离体文件)' : '(整系统)');
+    }).catch(function (e) { 宿.textContent = '问不到宿主: ' + e.message; });
+  }
+  function 存() {
+    var v = document.getElementById('t').value;
+    if (!有宿主()) { 内存 = v; 话('存在内存里了(离体)'); return; }
+    window.mycelium.call('data.set', { key: 'media:便签', value: { text: v, at: Date.now() } })
+      .then(function () { 话('存进系统了'); })
+      .catch(function (e) { 话('没存上: ' + e.message); });
+  }
+  function 读() {
+    if (!有宿主()) { document.getElementById('t').value = 内存; 话('读的是内存(离体)'); return; }
+    window.mycelium.call('data.get', { key: 'media:便签' })
+      .then(function (r) { document.getElementById('t').value = (r.value || {}).text || ''; 话('读到了'); })
+      .catch(function (e) { 话('还没有内容: ' + e.message); });
+  }
+  document.getElementById('save').onclick = 存;
+  document.getElementById('load').onclick = 读;
+  // 孢子也可以反过来给宿主供能力(hypha.invoke 调得到)
+  if (window.mycelium && window.mycelium.expose) {
+    window.mycelium.expose('便签.内容', function () { return document.getElementById('t').value; });
+  }
+  认宿主();
+})();
+</script>
+</body>
+</html>

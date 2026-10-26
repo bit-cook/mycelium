@@ -1,0 +1,3006 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mycelium</title>
+<style>
+/* 裸壳页自用样式。颜色写死: 设计变量归桌面块, 裸壳不依赖任何块 */
+html,body{margin:0;height:100%;background:#0b0d10;color:#e8ecf0;
+font-family:-apple-system,"PingFang SC",sans-serif}
+#mycelium-root{min-height:100%}
+.k-banner{background:#3a2a00;color:#ffd60a;padding:8px 14px;font-size:13px}
+</style>
+</head>
+<body>
+<!--MYCELIUM-LINEAGE {"id":"b3420b30b3497974","parent":"","at":"2026-10-26T19:45:43.071Z","blocks":[{"id":"agent","version":1},{"id":"ai","version":1},{"id":"desktop","version":1},{"id":"pocket","version":1}]}-->
+<div id="mycelium-root"></div>
+<script id="hypha">
+/* ═══════════════════════════════════════════════════════════════════════════
+   Hypha · Mycelium 的内核
+   ─────────────────────────────────────────────────────────────────────────
+   一个文件跑得起来的个人 AI 操作系统的最小内核。它自己也是"一块":
+   段(section)/范围(scope)/借用(borrow)三件套让代码可被程序理解和局部修改;
+   能力网(the Net)是块与块、块与 agent、块与小应用之间唯一的交互协议;
+   改块是唯一写入口, 带回滚、预览、审批; 导出永远过门禁。
+
+   设计原则(从 Colony 继承并加强):
+   1. 零依赖: 不 import 任何库, 不构建即可跑; 多文件只是开发态, 发布仍是单文件
+   2. 注释即接口: 段头/借用行/自报段都是人和 agent 都读得懂的协议
+   3. 单一写入口: 一切状态变更经 setNodule / sub.set, 才能做日志、快照、回滚
+   4. 对 agent 透明: agent 能读全部源码、改任何段、看自己的系统提示原文
+   5. 坏一块不拖垮全部: 装载容错, 块坏了自己记错, 别人照跑
+   6. 说人话: 每条错误都讲清"谁、为什么、怎么办"
+
+   文件形态(发布态): 一个 mycelium.html, 双击即用。
+     script#hypha          内核(本文件)
+     script#hypha-launcher 启动器: 认血统、注入 env、调 boot
+     script[type=mycelium/nodule]  块: NODULE 清单 + CODE 函数体, 一个块一个标签
+   ═══════════════════════════════════════════════════════════════════════════ */
+;(function (g) {
+  'use strict';
+
+  // ══════════ 基础 ══════════
+  // env 由启动器(或测试)注入: 内核不直接摸全局, 所以在 node 里也能跑
+  let E = null;                       // {doc, win, ls, idb, fetch, setTimeout, clearTimeout}
+  const doc = () => E.doc, win = () => E.win, LS = () => E.ls;
+  const norm = s => String(s ?? '').replace(/^\s*\n/, '').replace(/\s+$/, '');
+  const fail = msg => { throw new Error(msg); };
+  const SCR = 'scr' + 'ipt';
+  const emit = (name, detail) => {
+    const d = E?.doc;
+    if (d) d.dispatchEvent(new CustomEvent(name, { detail: detail || {} }));
+  };
+  const on = (name, fn) => {          // 文档级事件; 无文档(node 测试)时空转
+    const d = E?.doc;
+    if (!d) return () => { };
+    const h = e => { try { fn(e.detail); } catch (err) { console.error('[on ' + name + ']', err); } };
+    d.addEventListener(name, h);
+    return () => d.removeEventListener(name, h);
+  };
+  const sleep = ms => new Promise(r => E.setTimeout(r, ms));
+  const hash = s => {                 // 双 hash: 碰撞概率随长度指数下降, 做基线号/指纹
+    s = String(s ?? '');
+    let a = 5381, b = 2166136261;
+    for (let i = 0, c; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      a = ((a << 5) + a + c) >>> 0;
+      b = Math.imul(b ^ c, 16777619) >>> 0;
+    }
+    return [a, b].map(n => n.toString(16).padStart(8, '0')).join('');
+  };
+  const clone = x => x == null ? x : JSON.parse(JSON.stringify(x));
+  const isIdent = n => /^[\p{ID_Start}_$][\p{ID_Continue}_$]*$/u.test(String(n));
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+  const now = () => Date.now();
+  const uid = p => (p || '') + now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+  // ══════════ 形状 ══════════
+  // 能力参数用形状描述, 两种写法都认:
+  //   简写(内核用): { name: 'string', full: 'boolean?', active: 'edited|factory?' }
+  //               字符串 = 类型, 结尾 ? = 可选, 带 | = 枚举
+  //   全写(块用):  { name: { type: 'string', description: '显示名' } }  —— JSON Schema 子集
+  // 校验器 ~70 行, 内联进内核: 契约必须是内核的一部分, 不能靠外部库。
+  // 三种写法都认(只在外层规范化一次, 递归里传过的都是已规范化的 Schema):
+  //   内核简写  { id: 'string', full: 'boolean?' }          值 = '类型?' 字符串, ? 结尾可选, | 分隔枚举
+  //   块平铺    { name: { type: 'string', description } }    值 = JSON Schema 片段
+  //   标准式    { type: 'object', properties: {...} }        原样用
+  const 正化 = s => {
+    if (!s || typeof s !== 'object' || !Object.keys(s).length) return s;
+    // 含任一 Schema 形状关键字的, 就是(或像)一个完整 Schema, 不当字段表
+    // (additionalProperties / required / default 不算: 它们也可能是字段名)
+    const 关键字 = ['type', 'properties', 'enum', 'items', 'description', 'minLength',
+      'oneOf', 'anyOf', 'format'];
+    if (Object.keys(s).some(k => 关键字.includes(k))) return s;
+    const { additionalProperties, ...字段 } = s;
+    const 值 = Object.values(字段);
+    const 简写 = 值.length && 值.every(v => typeof v === 'string');
+    const 平铺 = 值.length && 值.every(v => v && typeof v === 'object' && !Array.isArray(v));
+    if (!简写 && !平铺) return s;                       // 认不出: 不校验, 不添乱
+    const out = { type: 'object', properties: {} };
+    if (additionalProperties !== undefined) out.additionalProperties = additionalProperties;
+    const 原型 = ['string', 'number', 'boolean', 'object', 'array', 'null'];
+    Object.entries(字段).forEach(([k, v]) => {
+      if (typeof v === 'string') {
+        const 净 = v.replace(/\s*\([^()]*\)\s*$/, '').trim();    // 剥掉尾部 (说明)
+        const 问 = /\?$/.test(净), 干 = 净.replace(/\?$/, '').trim(), 些 = 干.split('|');
+        const 阵 = /^([a-z]+)\[\]$/.exec(干);
+        out.properties[k] = 阵 && 原型.includes(阵[1]) ? { type: 'array', items: { type: 阵[1] } }
+          : 些.every(x => 原型.includes(x))
+            ? { type: 些.length > 1 ? 些 : 些[0] }    // string|null = 类型联合
+            : { enum: 些 };                          // edited|factory = 枚举
+        if (!问) (out.required ||= []).push(k);
+      } else out.properties[k] = v;
+    });
+    return out;
+  };
+  const checkShape = (v, s0, at = '') => {
+    const s = 正化(s0);
+    if (!s || typeof s !== 'object') return;
+    const T = (Array.isArray(s.type) ? s.type : [s.type]).filter(Boolean), kind = v === null ? 'null'
+      : Array.isArray(v) ? 'array' : typeof v;
+    if (T.length && !T.includes(kind))
+      fail(`${at || '参数'} 要是 ${T.join('|')}, 给了 ${kind}(${JSON.stringify(v).slice(0, 40)})`);
+    if (s.enum && !s.enum.includes(v))
+      fail(`${at} 只能是 ${s.enum.map(x => JSON.stringify(x)).join(' / ')}, 给了 ${JSON.stringify(v)}`);
+    if (kind === 'object' && s.properties) {
+      (s.required || []).forEach(k => {
+        if (v[k] === undefined) fail(`${at} 缺 ${k}(${s.properties[k]?.description || ''})`);
+      });
+      if (s.additionalProperties === false)
+        Object.keys(v).forEach(k => {
+          if (!s.properties[k]) fail(`${at} 有不认识的字段 ${k}; 允许: ${Object.keys(s.properties).join(', ')}`);
+        });
+      Object.keys(s.properties).forEach(k => {
+        if (v[k] !== undefined) checkShape(v[k], 正化(s.properties[k]), at ? at + '.' + k : k);
+      });
+    }
+    if (kind === 'array' && s.items && Array.isArray(v))
+      v.forEach((x, i) => checkShape(x, 正化(s.items), `${at}[${i}]`));
+    if (kind === 'string' && s.minLength && v.length < s.minLength) fail(`${at} 至少 ${s.minLength} 个字`);
+  };
+  // 给人/agent 看的一句话参数表: "name(厂商显示名) endpoint?(只填到版本前缀)"
+  const shapeLine = s => {
+    const q = 正化(s);
+    return !q?.properties ? '' : Object.entries(q.properties)
+      .map(([k, p]) => k + ((q.required || []).includes(k) ? '' : '?') + (p.description ? `(${p.description})` : ''))
+      .join(', ');
+  };
+
+  // ══════════ 段解析 ══════════
+  // 块的代码结构协议(人和程序都读):
+  //   // ═ 段名 · v2 ═                 段头: 管到下一段头; 一行代码必属于且只属于一段
+  //   // ═ 段名 · 跟着: a, b ═         这段要用 a/b(范围或段): 剪段时连它们一起剪
+  //   // ↦ 借 ai 的 协议适配           借用行: 整段是另一个块的段/范围, 经段值表懒取值
+  //   // ✂ 范围名  ...  // ✂ 范围名 完   范围: 可跨段、嵌套、交叉
+  //   // ✂ 离体时不带 · 号: n  ... 完   离体(孢子导出)时不留的代码, 导回按号找回
+  // 段头元数据键(中文, 说人话):
+  const KEY = { 跟着: 'follows', 源自: 'from', 要: 'want', 按需: 'ask', 带了: 'got',
+    指纹: 'sum', 借用者: 'borrowers', 号: 'tag' };
+  const MARK = /^\s*\/\/\s*(?:═+\s*(.+?)\s*═+|(↦|✂)\s*(.+?))\s*$/;
+  const blank = name => ({ name, v: 0, follows: [], want: [], got: [], borrowers: [],
+    from: null, map: null, sum: '', tag: '' });
+  const mark = line => {
+    const m = MARK.exec(line);
+    if (!m) return null;
+    const [n, ...f] = (m[1] || m[3]).split(/\s*·\s*/);
+    const b = m[2] && (m[2] === '↦'
+      ? /^借\s+(\S+)\s+的\s+(.+)$/.exec(n)
+      : /^(.+?)(\s+完)?$/.exec(n));
+    if (m[2] && !b) return null;       // 有 ↦/✂ 却不像借用行/范围行: 不是标记
+    const s = blank(!b ? n : m[2] === '↦' ? b[2] : b[1]);
+    if (m[2] === '↦') s.map = { block: b[1], name: b[2] };
+    if (m[2] === '✂') Object.assign(s, { cut: true, end: !!b[2] });
+    f.forEach(x => {
+      const [, k, v] = /^(\S+?)\s*[:：]\s*(.*)$/.exec(x) || [], key = KEY[k];
+      if (/^v\d+$/.test(x)) s.v = +x.slice(1);
+      else if (key === 'from' && /^(\S+?)\/(.+?)(?:\s+v(\d+))?$/.test(v)) {
+        const o = /^(\S+?)\/(.+?)(?:\s+v(\d+))?$/.exec(v);
+        s.from = { block: o[1], name: o[2], v: +(o[3] || 0) };
+      } else if (key) s[key] = /ask|sum|tag/.test(key) ? v.trim()
+        : v.split(/\s*[,，]\s*/).filter(Boolean);
+      else fail(`标记认不出: "${x}"(${s.name})。允许: v数字 / ${Object.keys(KEY).join(' / ')}`);
+    });
+    return s;
+  };
+  const parseSegs = code => {
+    const out = { prologue: [], segs: [] };
+    let cur = null;
+    String(code).split('\n').forEach(line => {
+      const h = mark(line);
+      if (h && !h.cut) out.segs.push(cur = Object.assign(h, { lines: [line] }));
+      else if (cur) cur.lines.push(line);
+      else out.prologue.push(line);
+    });
+    out.segs.forEach(s => { s.text = s.lines.join('\n'); });
+    return out;
+  };
+  const joinSegs = p => p.prologue.concat(...p.segs.map(s => s.lines)).join('\n');
+  const headLine = s => (s.map ? '// ↦ 借 ' + s.map.block + ' 的 ' + s.map.name : '// ═ ' + s.name)
+    + (s.v ? ' · v' + s.v : '') + Object.entries(KEY).map(([k, key]) => {
+      const f = s.from, v = key === 'from' ? f && f.block + '/' + f.name + (f.v ? ' v' + f.v : '') : s[key];
+      return v?.length ? ' · ' + k + ': ' + [].concat(v).join(', ') : '';
+    }).join('') + (s.map ? '' : ' ═');
+  const bodyOf = s => s.lines.slice(1).join('\n');
+  const segKey = s => headLine(Object.assign({}, s, { borrowers: [] })) + '\n' + bodyOf(s);
+  const checkSegs = (p, where) => {
+    const seen = {};
+    p.segs.forEach(s => {
+      if (seen[s.name]) fail(`段名重复: ${where}/${s.name}`);
+      seen[s.name] = 1;
+    });
+    return p;
+  };
+  // 排开: 每行属于哪段(-1 = 前言)、在哪些范围里、范围配对、范围要什么(need)
+  const 离体 = '离体时不带';
+  const lay = (p, where, 宽) => {
+    const L = { p, where, lines: p.prologue.concat(...p.segs.map(s => s.lines)),
+      seg: [], in: [], cut: [], pair: [], need: {}, 处: {} }, open = [];
+    const 在 = () => open.find(o => o[0] === 离体)?.[1];
+    const 坏 = m => { if (宽) L.坏 ||= m; else fail(m); };
+    let n = -1;
+    L.lines.forEach((l, i) => {
+      const m = mark(l), at = `第 ${i + 1} 行: `;
+      const k = m?.cut ? open.findLastIndex(o => o[0] === m.name) : -1;
+      if (m && !m.cut && 在() >= 0) 坏(at + `「${离体}」不能圈段头`);
+      L.seg.push(m && !m.cut ? ++n : n);
+      L.in.push(new Set(open.map(o => o[0]).concat(m?.cut ? m.name : [])));
+      if (!m?.cut) return;
+      L.cut[i] = m.name;
+      if (m.end) {
+        if (k < 0) return 坏(at + `「${m.name} 完」前面没有开头`);
+        const [, h, 头在] = open.splice(k, 1)[0];
+        if (头在 !== 在()) 坏(at + `「${m.name}」和「${离体}」交叉: ${离体} 只能整个包住别的范围, 或一头都不碰`);
+        return L.pair[L.pair[i] = h] = i;
+      }
+      if (k >= 0) 坏(at + `「${m.name}」没收尾又开了一个同名的`);
+      if (m.name !== 离体) L.need[m.name] = (L.need[m.name] || []).concat(m.want);
+      else if (!m.tag) 坏(at + `「${离体}」要起个名字: // ✂ ${离体} · 号: 名`);
+      else if (m.tag in L.处) 坏(at + `「${离体}」的号「${m.tag}」重了`);
+      else L.处[m.tag] = i;
+      open.push([m.name, i, 在()]);
+    });
+    if (open.length) 坏(`范围「${open[0][0]}」没有收尾`);
+    return L;
+  };
+  // 名单连一路「跟着」「要」到的 [范围名集合, 段号集合, 缺的名字]
+  const 连 = (L, names) => {
+    const R = new Set(), S = new Set(), 缺 = [], by = {};
+    L.p.segs.forEach((s, i) => { by[s.name] = i; });
+    const add = n => n in L.need ? (R.has(n) || (R.add(n), L.need[n].forEach(add)))
+      : n in by ? (S.has(by[n]) || (S.add(by[n]), L.p.segs[by[n]].follows.forEach(add)))
+        : 缺.push(n);
+    names.forEach(add);
+    return [R, S, 缺];
+  };
+  // 剪: 圈着的行, 圈它的范围有一个在名单上就留; 没圈的行和段头, 它那段在名单上就留;
+  // 「离体时不带」圈的不留; 头尾只剩一个的标记行不留。names = null = 整份都要。
+  const pick = (L, names, skip) => {
+    const [R, S, 缺] = 连(L, names || []);
+    if (缺.length) fail(`${L.where} 没有叫「${缺[0]}」的段或范围, 范围有: ${Object.keys(L.need).join(', ')}`);
+    const k = L.lines.map((l, i) => !skip?.(i) && (L.in[i].has(离体)
+      ? !names && L.cut[i] === 离体
+      : !names || [...L.in[i]].some(r => R.has(r))
+        || (!L.in[i].size || L.seg[i] !== L.seg[i - 1]) && S.has(L.seg[i])));
+    return k.map((x, i) => x && !(L.cut[i] && !k[L.pair[i]]));
+  };
+  const 纹 = s => hash(norm(s)).slice(0, 8);
+  const cutCode = (code, names, where, 号 = []) => {
+    const L = lay(parseSegs(code), where), k = pick(L, names);
+    k.forEach((x, i) => x && 号.push(i));
+    return L.lines.filter((l, i) => k[i]).join('\n');
+  };
+  // 剪一份带走(借用方导出、源头不在场时用): 名字(点的+要+带了)合剪一份放第一行,
+  // 后面几行各留一个空的复制段头, 导回时一行对一行。段头写源自/要/指纹。
+  const 有 = p => new Set(p.segs.flatMap(s => {
+    const o = s.map || s.from;
+    return !o ? [] : [o.name].concat(s.from ? s.lines.map(l => (/^\/\/ ─ (.+) ─$/.exec(l) || [])[1]) : [])
+      .filter(Boolean).map(n => o.block + '/' + n);
+  }));
+  const copyOf = (src, id, g, have, 号 = [], 不) => {
+    const L = lay(src, id, 不), 错 = g.map(([s]) => s.got).find(x => x instanceof Error), out = [];
+    g.forEach(([s]) => { s.got = 错 ? [] : s.got.filter(n => Object.hasOwn(L.need, n) || src.segs.some(x => x.name === n)); });
+    const 名 = g.flatMap(([s, n]) => [n].concat(s.want, s.got)), 缺 = 连(L, 名)[2];
+    const 别 = n => !名.includes(n) && have.has(id + '/' + n);
+    const k = !L.坏 && !错 && !缺.length && pick(L, 名, i => 别(src.segs[L.seg[i]]?.name));
+    const t = k && src.segs[L.seg[k.findIndex((x, i) => x && src.segs[L.seg[i]]?.map)]];
+    const why = L.坏 || 错?.message || (缺.length ? 没名(L, 缺[0])
+      : t && `它要用的「${t.name}」也是借来的, 请让借用方自己借 ${t.map.block}/${t.map.name}`);
+    if (why && !不) fail(`带不走 ${id}/${g[0][1]}: ${why}`);
+    if (why) { g.forEach(([s]) => { 不[s.map.block + '/' + s.map.name] = why; }); return null; }
+    let last = null;
+    k.forEach((x, i) => {
+      const n = L.seg[i], s = src.segs[n] || { name: '(前言)' };
+      if (!x) return;
+      if (s !== last && s.name !== g[0][1]) out.push('// ─ ' + s.name + ' ─'), 号.push(L.seg.indexOf(n));
+      last = s;
+      if (n < 0 || n === L.seg[i - 1]) out.push(L.lines[i]), 号.push(i);
+    });
+    return g.map(([s], i) => {
+      const body = i ? '' : out.join('\n');
+      return headLine(Object.assign(blank(), s, { map: null, from: s.from || Object.assign({ v: s.v }, s.map),
+        sum: 纹(body) })) + (i ? '' : '\n' + body);
+    });
+  };
+  const 没名 = (L, n) => `${L.where} 没有叫「${n}」的段或范围, 范围有: ${Object.keys(L.need).join(', ')}`;
+  const syntax = (code, what, args) => {
+    try { new Function(...(args || []), code); }
+    catch (e) { fail(`${what}有语法错误: ${e.message}`); }
+  };
+  // 块代码里重声明了块参(ctx/__seg/colony): 说清那是内核给的
+  const 块参 = ['ctx', '__seg', 'colony'];
+  const 重名 = e => /(?:Identifier '|redeclaration of (?:formal parameter |\S+ )?|twice: ')([^'\s]+)/
+    .exec(e?.message)?.[1];
+  const 块参错 = (e, n = 重名(e)) => 块参.includes(n) ? `块里不能再声明 ${n}(内核给每块自己的 ${n})` : '';
+
+  // ══════════ 基质 ══════════
+  // 存储的唯一实现: IndexedDB(打不开退内存) + 事件日志(journal) + 快照(snapshot)。
+  // kv 是原始存取; 归属守卫在口袋块, 不在这里 —— 内核只管存, 不管谁该存。
+  const memStore = () => {
+    const m = new Map(), 拷 = x => x == null ? x : JSON.parse(JSON.stringify(x));
+    return {
+      get: async k => 拷(m.get(k)), set: async (k, v) => { m.set(k, 拷(v)); },
+      del: async k => { m.delete(k); }, clear: async () => { m.clear() },
+      list: async p => [...m].filter(([k]) => !p || String(k).startsWith(p))
+        .map(([key, value]) => ({ key, value: 拷(value) })),
+    };
+  };
+  const idbStore = name => {
+    let dbp = null;
+    const open = () => dbp || (dbp = new Promise((res, rej) => {
+      const r = E.idb.open(name, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('kv');
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    }));
+    const op = (mode, fn) => open().then(db => new Promise((res, rej) => {
+      const t = db.transaction('kv', mode), s = t.objectStore('kv'), q = fn(s);
+      t.onerror = () => rej(t.error);
+      if (q && 'onsuccess' in q) { q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }
+      else t.oncomplete = () => res(q);
+    })), w = fn => op('readwrite', fn).then(() => { });
+    return {
+      get: k => op('readonly', s => s.get(k)), set: (k, v) => w(s => s.put(v, k)),
+      del: k => w(s => s.delete(k)), clear: () => w(s => s.clear()),
+      list: p => op('readonly', s => {
+        const r = p ? IDBKeyRange.bound(p, p + '\uffff') : undefined;
+        return { ks: s.getAllKeys(r), vs: s.getAll(r) };
+      }).then(r => r.ks.result.map((k, i) => ({ key: k, value: r.vs.result[i] }))),
+    };
+  };
+  const Sub = {
+    store: null, mem: false, journalRing: [],
+    async open(id) {
+      this.store = E.idb ? idbStore(id) : memStore();
+      this.mem = !E.idb;
+      if (E.idb) {
+        try { await this.store.get(''); }   // 隐私模式/系统关数据: 退内存, 能看不能存
+        catch (e) { this.store = memStore(); this.mem = true; this.warn = e?.message || String(e); }
+      }
+      return this;
+    },
+    get: async k => (await Sub.store.get(k)) ?? null,
+    async set(k, v, by) {
+      await Sub.store.set(k, v);
+      Sub.记({ op: 'set', key: k, by, size: v == null ? 0 : JSON.stringify(v).length });
+    },
+    async del(k, by) {
+      await Sub.store.del(k);
+      Sub.记({ op: 'del', key: k, by });
+    },
+    list: p => Sub.store.list(p),
+    记(e) {                                   // 事件日志: 审计环(内存 500 条) + 可选持久
+      const x = Object.assign({ t: now(), seq: ++Sub.seq }, e);
+      Sub.journalRing.push(x);
+      if (Sub.journalRing.length > 500) Sub.journalRing.shift();
+      emit('mycelium:journal', x);
+    },
+    seq: 0,
+    read: ({ since = 0, limit = 200 } = {}) =>
+      Sub.journalRing.filter(x => x.t >= since).slice(-limit),
+    // 快照: 整库([k,v]) + 块记录, 存进 snapshot:<名>。回滚的权威手段。
+    async snapshot(name) {
+      const all = await Sub.store.list(''), entries = all.map(e => [e.key, e.value])
+        .filter(([k]) => !k.startsWith('snapshot:'));
+      const s = { name: name || uid('snap-'), at: now(), n: entries.length, entries };
+      await Sub.store.set('snapshot:' + s.name, s);
+      Sub.记({ op: 'snapshot', key: s.name, by: 'sub' });
+      return { name: s.name, at: s.at, n: s.n };
+    },
+    snapshots: async () => (await Sub.store.list('snapshot:')).map(e => e.value)
+      .sort((a, b) => b.at - a.at),
+    async restore(name) {
+      const s = await Sub.store.get('snapshot:' + name);
+      if (!s) fail(`没有叫「${name}」的快照; 现有: ${(await Sub.snapshots()).map(x => x.name).join(', ')}`);
+      const all = await Sub.store.list('');
+      for (const e of all) if (!e.key.startsWith('snapshot:')) await Sub.store.del(e.key);
+      for (const [k, v] of s.entries) await Sub.store.set(k, v);
+      Sub.记({ op: 'restore', key: name, by: 'sub' });
+      return { restored: name, keys: s.n, at: s.at };
+    },
+    async drop(name) { await Sub.store.del('snapshot:' + name); return { dropped: name }; },
+  };
+
+  // ══════════ 能力网 ══════════
+  // 块、孢子、agent 之间都走这一张表。call 总回 Promise(抛错即拒绝)。
+  // 三级权限:
+  //   open     直接执行(读数据、算东西)
+  //   notice   执行, 但广播 mycelium:notice(界面角标告诉用户"它调了这个")
+  //   guarded  要人批准(改块、发消息、花钱的调用)。autonomy 记忆可选。
+  // 每次调用留一条 span(示波器看得到), agent 调错的参数在调用前就被形状挡住。
+  const Net = {
+    CAP: {}, 私: {}, 外: null, spans: [], pending: new Map(), remembered: new Set(),
+    认: m => m.caps || [m.id.split(':').pop()],
+    头: p => String(p).split('.')[0],
+    主: p => L.factory.find(b => Net.认(b.manifest).includes(Net.头(p))),
+    provide(path, fn, meta = {}, by) {
+      const c = { fn, by, desc: meta.desc || '', schema: meta.schema || null,
+        level: meta.level || 'open', frames: meta.frames !== false,
+        common: meta.common === true || undefined };
+      // 前缀归哪块: 块清单 caps 写它有哪些前缀, 没写就是 id 末截; 内核自己的 hypha.* 总是公开
+      const caps = by === 'hypha' ? ['hypha'] : (blockOf(by) ? Net.认(blockOf(by).manifest) : []);
+      const T = caps.includes(Net.头(path)) ? Net.CAP : (Net.私[by] ||= {});
+      if (T[path] && T[path].by !== by) fail(`能力撞名: ${path} 已由 ${T[path].by} 提供`);
+      T[path] = c;
+      emit('mycelium:cap', { path, by, type: 'add', level: c.level });
+      return () => { delete T[path]; emit('mycelium:cap', { path, by, type: 'remove' }); };
+    },
+    找: (path, by) => Net.私[by]?.[path] || Net.CAP[path],
+    has: (path, by) => !!Net.找(path, by),
+    call(path, args, meta = {}) {
+      return new Promise((res, rej) => {
+        const c = Net.找(path, meta.by);
+        if (!c && Net.外) return res(Net.外.call(path, clone({ ...args, stream: false })));
+        if (!c) {
+          const o = Net.主(path), near = Object.keys(Net.CAP).filter(p => Net.头(p) === Net.头(path)).sort();
+          if (o && !L.inst[o.manifest.id]) return rej(new Error(`「${o.manifest.name || o.manifest.id}」块停用了, 调不了 ${path}`));
+          return rej(new Error(`无此能力: ${path}` + (near.length ? `。同名空间下有: ${near.join(', ')}` : '。用 hypha.catalog 看清单')));
+        }
+        if (meta.frame && !c.frames) return rej(new Error(`隔离窗里不能调用 ${path}(它要改宿主)`));
+        let a = args ?? {};
+        try { checkShape(a, c.schema, path); }
+        catch (e) { return rej(e); }
+        const span = { id: uid('sp-'), path, by: meta.by || '?', level: c.level, at: now(), args: Net.摘要(a) };
+        Net.spans.push(span);
+        if (Net.spans.length > 500) Net.spans.shift();
+        const done = err => { span.ms = now() - span.at; span.ok = !err; if (err) span.err = err.message; emit('mycelium:span', span); };
+        const go = () => Promise.resolve()
+          .then(() => c.fn(a, meta))
+          .then(v => { done(null); res(v); }, e => { done(e); rej(e); });
+        if (c.level === 'open') return go();
+        if (c.level === 'notice') { emit('mycelium:notice', { path, by: meta.by, args: span.args, desc: c.desc }); return go(); }
+        // guarded: 审批
+        const auto = Net.remembered.has(path) && Net.autonomy !== 'ask';
+        if (auto || Net.autonomy === 'auto') return go();
+        if (!doc()) return rej(new Error(`${path} 要人批准, 但现在没有界面能问(无头环境默认拒绝)`));
+        const req = { id: uid('ap-'), path, by: meta.by || '?', args: span.args, desc: c.desc, at: now() };
+        Net.pending.set(req.id, { res, rej, span, go, req });
+        emit('mycelium:approve', req);
+        E.setTimeout(() => {
+          if (Net.pending.has(req.id)) Net.decide(req.id, false);
+        }, 300000);
+      });
+    },
+    // 脱敏摘要: key/token/secret 打码, 长的截断
+    摘要: a => {
+      let s;
+      try { s = JSON.stringify(a, (k, v) => /key|token|secret|password/i.test(k) ? '***' : v); }
+      catch (e) { s = String(a); }
+      return s.length > 300 ? s.slice(0, 300) + `…(共 ${s.length} 字)` : s;
+    },
+    autonomy: 'remember',                // 'ask' 每次问 | 'remember' 记住选择 | 'auto' 不拦
+    decide(reqId, ok, remember) {
+      const p = Net.pending.get(reqId);
+      if (!p) return false;
+      Net.pending.delete(reqId);
+      if (remember) Net.remembered.add(p.req.path);
+      if (ok) p.go(); else {
+        const e = new Error(`用户拒绝了 ${p.req.path}`);
+        p.span.ok = false; p.span.err = 'rejected'; emit('mycelium:span', p.span);
+        p.rej(e);
+      }
+      return true;
+    },
+    catalog(by) {
+      const T = { ...Net.CAP, ...Net.私[by] || {} };
+      return Object.keys(T).sort().map(path => {
+        const { fn, ...c } = T[path];
+        return { path, desc: c.desc, level: c.level, schema: c.schema,
+          args: shapeLine(c.schema), by: c.by, common: c.common };
+      });
+    },
+    revoke(by) { [Net.CAP, Net.私[by] || {}].forEach(T => Object.keys(T).forEach(p => {
+      if (T[p].by === by) { delete T[p]; emit('mycelium:cap', { path: p, by, type: 'remove' }); }
+    })); },
+    trace: ({ path, by, limit = 100 } = {}) => Net.spans.filter(s =>
+      (!path || s.path.includes(path)) && (!by || s.by === by)).slice(-limit),
+  };
+  // 内核自己的能力: 实现它的段末尾登记。level: open 直接跑 / notice 跑但广播 / guarded 要人批准
+  const P = (path, fn, desc, schema, frames, level) =>
+    Net.provide(path, fn, { desc, schema, frames: frames !== false, common: true, level: level || 'open' }, 'hypha');
+
+  // ══════════ 块接口 ══════════
+  // 块代码 = function (ctx, __seg, colony) 的函数体, 不带 function 外壳。
+  // ctx: id/root/kv/provide/call/has/on/cleanup/trace/log
+  const L = { store: null, factory: [], recs: {}, inst: {}, errors: {}, broken: [],
+    safe: false, head: '', launcher: '', stemFactory: '', booting: false };
+  const blockOf = id => L.factory.find(b => b.manifest.id === id);
+  const ctxFor = id => {
+    const cleanups = [];
+    let root = null;
+    if (doc() && !E?.boot?.headless) {       // 无头(测试)不给 root: 块的界面代码自然不跑
+      root = doc().createElement('div');
+      root.setAttribute('data-nodule-id', id);
+      (doc().getElementById('mycelium-root') || doc().body).appendChild(root);
+      cleanups.push(() => root.remove());
+    }
+    const ctx = {
+      id, root,
+      provide: (path, fn, meta) => Net.provide(path, fn, meta, id),
+      call: (path, args) => Net.call(path, args, { by: id }),
+      has: path => Net.has(path, id),
+      on: (name, fn) => { const off = on(name, fn); cleanups.push(off); return off; },
+      trace: msg => { Sub.记({ op: 'log', key: id, by: id, note: String(msg).slice(0, 200) }); },
+      log: (...a) => console.log('[' + id + ']', ...a),
+      cleanup: fn => cleanups.push(fn),
+      // kv 是全库共享; 块记录不让直接写, 因为那是 setNodule 的地盘
+      kv: guardKv({
+        get: k => Sub.get(k), set: (k, v) => Sub.set(k, v, id), del: k => Sub.del(k, id),
+        list: p => Sub.list(p),
+      }),
+    };
+    const colony = { call: ctx.call, has: ctx.has, get solo() { return !!BOOT.solo; } };
+    return { ctx, cleanups, colony };
+  };
+  const guardKv = store => {           // 块记录只能经 setNodule 改
+    const chk = k => String(k).startsWith('block:')
+      ? Promise.reject(new Error('块记录只能经 hypha.setNodule 改: ' + k)) : Promise.resolve();
+    return { get: k => store.get(k), set: (k, v) => chk(k).then(() => store.set(k, v)),
+      del: k => chk(k).then(() => store.del(k)), list: p => store.list(p) };
+  };
+
+  // ══════════ 段值表 ══════════
+  // 借用方拿到懒取值代理: 值不靠装载顺序, 源头晚到靠 mycelium:cap 事件接上
+  const SEG = {};
+  const segRef = (key, why) => {
+    const peek = () => { try { return SEG[key]; } catch (e) { } }, get = () => {
+      const v = peek();
+      if (v === undefined) {
+        const src = key.split('/')[0], b = blockOf(src), 开 = b && isEnabled(b);
+        fail(b && 停(src) ? `源头块 ${src} ${开 ? '坏了' : '已禁用'}, 借不到 ${key}`
+          + (why ? `; 剪不出一份来: ${why}` : '') + `: ${开 ? '修好' : '启用'}它, 或把这段复制过来`
+          : `借的段还没就位: ${key}(源头块从未装载, 或它没有这个名字的段)`);
+      }
+      if (Object(v) !== v) fail(`借的 ${key} 是单个的值, 借过来是个代理, 用不了: 请包成对象`);
+      return v;
+    };
+    return new Proxy(function () { }, {
+      apply: (_, t, a) => get().apply(t, a),
+      construct: (_, a) => Reflect.construct(get(), a),
+      get: (_, p) => {
+        if (typeof p !== 'string' || p === 'then' || p === 'toJSON') {
+          const v = peek();
+          return v == null ? undefined : v[p];
+        }
+        return get()[p];
+      },
+      set: (_, p, v) => { get()[p] = v; return true; },
+      has: (t, p) => p in get() || p in t,
+    });
+  };
+  // 段名/范围名都登记; 映射段生成 const 名 = __seg.ref('块/名')
+  const forRun = (id, eff) => {
+    const out = eff.prologue.slice();
+    new Set(eff.segs.map(s => s.name).concat(Object.keys(lay(eff, id, 1).need))).forEach(n => {
+      if (isIdent(n)) out.push(`__seg.set(${JSON.stringify(n)}, () => ${n});`);
+    });
+    eff.segs.forEach(s => {
+      if (s.map) {
+        if (!isIdent(s.name)) fail(`段名「${s.name}」不是合法标识符, 不能映射`);
+        out.push(s.lines[0], `const ${s.name} = __seg.ref(${JSON.stringify(s.map.block + '/' + s.map.name)});`,
+          ...s.lines.slice(1));
+      } else out.push(headLine({ ...s, borrowers: [] }), ...s.lines.slice(1));
+    });
+    return out.join('\n');
+  };
+  const 停 = x => (x = blockOf(x)) && !(isEnabled(x) && !L.errors[x.manifest.id]);
+  const 问来 = {};                     // 按需问来的(借用方跑起来才问得到)
+  // 停用/坏掉的源头: 导出一个没有它的 Mycelium 时的那份(换剪一份), 剪不出的照旧借
+  const 跑码 = b => {
+    const id = b.manifest.id, eff = checkSegs(effectiveOf(b), id), 不 = {};
+    return { 不, code: forRun(id, eff.segs.some(s => s.map && 停(s.map.block))
+      ? parseSegs(换(joinSegs(eff), id, { has: x => !停(x) }, 问来, {}, 不).code) : eff) };
+  };
+  const 重剪 = async () => {
+    const bs = L.factory.filter(b => L.inst[b.manifest.id]
+      && effectiveOf(b).segs.some(s => s.map && blockOf(s.map.block)));
+    Object.assign(问来, await 问(bs.filter(b => effectiveOf(b).segs.some(s => s.ask && 停(s.map?.block)))));
+    const re = bs.filter(b => L.inst[b.manifest.id] && b._run !== 跑码(b).code);
+    re.forEach(b => { dispose(b.manifest.id); tryRun(b); });
+    if (re.length) emit('mycelium:blocks');
+  };
+
+  // ══════════ 装载 ══════════
+  const isEnabled = b => {
+    const r = L.safe ? null : L.recs[b.manifest.id];
+    return r?.enabled !== undefined ? !!r.enabled : !b.adopted && !b.tagDisabled;
+  };
+  const instantiate = b => {
+    const id = b.manifest.id;
+    if (L.inst[id]) return;
+    if (!isEnabled(b)) { L.errors[id] = '已禁用'; return; }
+    const o = ctxFor(id);
+    let seg = null;
+    try {
+      const r = 跑码(b);
+      o.colony.停着 = x => 停(x) && (blockOf(x).manifest.name || x);
+      b._run = r.code;
+      checkCode(b._run, id);
+      seg = {
+        set: (n, get) => Object.defineProperty(SEG, id + '/' + n, { get, enumerable: true, configurable: true }),
+        ref: k => segRef(k, r.不[k]),
+        clear: () => Object.keys(SEG).forEach(k => { if (k.startsWith(id + '/')) delete SEG[k]; }),
+      };
+      const ret = new Function(...块参, b._run)(o.ctx, seg, o.colony);
+      L.inst[id] = Object.assign(o, { dispose: ret?.dispose || null });
+      delete L.errors[id];
+    } catch (e) {
+      o.cleanups.forEach(f => { try { f(); } catch (_) { } });
+      Net.revoke(id);
+      if (seg) seg.clear();
+      L.errors[id] = 块参错(e) || e.message;
+      throw e;
+    }
+  };
+  const tryRun = b => { try { instantiate(b); } catch (e) { console.error('[nodule]', b.manifest.id, e); } };
+  const 被借的先 = 序 => {              // 被借的先装: 源头坏了先露出来, 借它的装时就剪一份
+    const 剩 = 序.splice(0), 借着 = b => effectiveOf(b).segs.some(s => 剩.some(x => x !== b
+      && x.manifest.id === s.map?.block));
+    while (剩.length) 序.push(...剩.splice(Math.max(0, 剩.findIndex(b => !借着(b))), 1));
+  };
+  const assembleAll = async () => {
+    L.booting = true; L.errors = {}; L.broken = [];
+    L.factory = [];
+    // 上一次的兜底面板撤掉: 界面块可能回来了(它画在 mycelium-root 里, 会盖住块的界面)
+    if (doc()) doc().querySelectorAll('[data-k-panel]').forEach(el => el.remove());
+    if (doc()) doc().querySelectorAll(`${SCR}[type="mycelium/nodule"]`).forEach(el => {
+      try {
+        const b = parseBlock(el.textContent);
+        if (blockOf(b.manifest.id)) fail('块 id 重复: ' + b.manifest.id);
+        if (el.getAttribute('data-disabled')) b.tagDisabled = true;
+        L.factory.push(b);
+      } catch (e) { L.broken.push({ id: el.getAttribute('data-id') || '?', error: e.message }); }
+    });
+    L.recs = {};
+    for (const e of await Sub.list('block:')) {
+      const id = String(e.key).slice(6);
+      L.recs[id] = e.value;
+      if (!L.safe && e.value?.adopted && !blockOf(id)) {
+        try { L.factory.push(Object.assign(parseBlock(e.value.adopted), { adopted: true })); }
+        catch (err) { L.broken.push({ id, error: '收养记录损坏: ' + err.message }); }
+      }
+    }
+    const 序 = L.factory.slice().sort((a, b) => a.manifest.id < b.manifest.id ? -1 : 1);
+    被借的先(序);
+    序.forEach(tryRun);
+    await 重剪();
+    L.booting = false;
+    emit('mycelium:blocks');
+  };
+  const dispose = id => {
+    const i = L.inst[id];
+    if (!i) return;
+    try { if (i.dispose) i.dispose(); } catch (e) { console.error('[dispose]', id, e); }
+    i.cleanups.forEach(f => { try { f(); } catch (_) { } });
+    Net.revoke(id);
+    delete L.inst[id];
+  };
+
+  // ══════════ 块记录与改块 ══════════
+  // 记录: {enabled?, adopted?, segs:{名:{edited, active}}, order?, prologue?, layoutActive?}
+  // 原版永远在出厂文本里, 改版在记录里, active 说哪份显性
+  const recKey = id => 'block:' + id;
+  const effective = (factory, rec) => {
+    const fp = typeof factory === 'string' ? parseSegs(factory) : factory, byName = {},
+      segsRec = rec?.segs || {}, useLayout = rec?.layoutActive === 'edited',
+      names = useLayout && rec.order ? rec.order.slice() : fp.segs.map(s => s.name), segs = [], deleted = [];
+    fp.segs.forEach((s, i) => {
+      byName[s.name] = s;
+      if (!names.includes(s.name)) names.splice(Math.min(i, names.length), 0, s.name);
+    });
+    Object.keys(segsRec).forEach(n => { if (!names.includes(n)) names.splice(Math.max(names.length - 1, 0), 0, n); });
+    names.forEach(n => {
+      const r = segsRec[n], f = byName[n], hasEdit = !!r?.edited;
+      if (r?.active === 'edited' && r.edited != null) {
+        if (r.edited === '') return deleted.push(n);
+        const lines = r.edited.split('\n');
+        segs.push(Object.assign(mark(lines[0]) || blank(n), { name: n, text: r.edited, lines,
+          use: 'edited', hasEdit, factoryText: f ? f.text : null }));
+      } else if (f) segs.push(Object.assign({}, f, { use: 'factory', hasEdit, factoryText: f.text }));
+    });
+    return { prologue: useLayout && typeof rec.prologue === 'string' ? rec.prologue.split('\n') : fp.prologue,
+      segs, deleted };
+  };
+  const effectiveOf = b => effective(parsedOf(b), L.safe ? null : L.recs[b.manifest.id]);
+  const parsedOf = b => b._p?.src === b.code ? b._p : (b._p = Object.assign(parseSegs(b.code), { src: b.code }));
+  const revOf = id => hash(id === 'hypha' ? stemUse() + stemEdited() : JSON.stringify(L.recs[id] || null));
+  const 改版 = edited => ({ edited, active: 'edited' });
+  // 记一段: 和出厂一字不差就不算改过, 否则存成显性改版
+  const 记 = (b, rec, s) => parsedOf(b).segs.some(f => f.name === s.name && segKey(f) === segKey(s))
+    ? (rec.segs[s.name]?.active === 'factory' || delete rec.segs[s.name])
+    : (rec.segs[s.name] = 改版(s.text));
+  const applyEdits = (b, rec, edits, id) => {
+    if (!Array.isArray(edits)) fail('edits 要是数组');
+    edits.forEach(sg => {
+      if (!sg || typeof sg.name !== 'string') fail('segment 要有 name');
+      const cur = effective(parsedOf(b), rec).segs.find(s => s.name === sg.name);
+      let text = sg.text;
+      if (sg.replace !== undefined) {          // replace 只换对上的那一处: 比整段重写稳
+        if (text !== undefined) fail('text(整段重写)和 replace(只换几处)只能给一个');
+        text = (cur || fail('无此段: ' + sg.name)).text;
+        [].concat(sg.replace).forEach(r => {
+          if (!r || typeof r.old !== 'string' || !r.old || typeof r.new !== 'string')
+            fail('replace 每项要 {old, new}, 都是字符串, old 不能空');
+          const n = text.split(r.old).length - 1;
+          if (n !== 1) fail(`段 ${sg.name} 里${n ? `有 ${n} 处` : '找不到'}「${r.old.slice(0, 40)}」: old 要和原文一字不差, 且只对上一处`);
+          text = text.replace(r.old, () => r.new);
+        });
+      }
+      if (typeof text === 'string') {
+        text = norm(text);
+        checkCode(text, id);
+        const p = parseSegs(text);
+        if (p.prologue.length || p.segs.length !== 1 || p.segs[0].name !== sg.name)
+          fail(`段文本必须以这段自己的段头开头, 且只含这一段: ${sg.name}`);
+        记(b, rec, p.segs[0]);
+      } else if (text === null) rec.segs[sg.name] = 改版('');   // 删段
+      if (sg.active !== undefined) {
+        if (sg.active !== 'edited' && sg.active !== 'factory') fail("active 只能是 'edited' 或 'factory'");
+        if (!rec.segs[sg.name]) fail(`段 ${sg.name} 没有改版, 无从切换`);
+        rec.segs[sg.name].active = sg.active;
+      }
+    });
+  };
+  const checkCode = (code, id) => {
+    if (/<\/script/i.test(code)) fail(`块 ${id} 含字面闭合标签, 请写成 <\\/${SCR}>`);
+    if (new RegExp('<!--[\\s\\S]*?<' + SCR, 'i').test(code))
+      fail(`块 ${id} 里 <!-- 与 <${SCR} 同现会打乱 HTML 解析, 请写成 "<!" + "--"`);
+  };
+  const checkManifest = m => {
+    if (typeof m.id !== 'string' || !/^[^"<>\/\s]+$/.test(m.id))
+      fail('清单 id 不合法(不能含引号、尖括号、斜杠、空白; 斜杠是"块/段"的分隔): ' + JSON.stringify(m.id));
+    if (m.version !== undefined && typeof m.version !== 'number') fail('清单 version 必须是数字');
+    if (m.name !== undefined && typeof m.name !== 'string') fail('清单 name 必须是字符串');
+    if (m.caps && !(Array.isArray(m.caps) && m.caps.every(x => typeof x === 'string')))
+      fail('清单 caps 必须是字符串数组');
+  };
+  const parseBlock = text => {
+    const s = norm(text);
+    let m = /\/\*NODULE\*\/([\s\S]*?)\/\*CODE\*\//.exec(s), manifest, code;
+    if (m) {                                   // 单文件里的规范形式
+      manifest = JSON.parse(m[1].trim());
+      code = norm(s.slice(m.index + m[0].length));
+    } else {                                   // 开发态块文件: 头一行是注释, 文件本身就是合法 JS
+      const h = /^\/\/ @nodule (\{[\s\S]*?\})\s*\n/.exec(s)
+        || fail('块缺少 /*NODULE*/{清单}/*CODE*/ 头, 也没有 // @nodule {清单} 注释头');
+      manifest = JSON.parse(h[1]);
+      code = norm(s.slice(h[0].length));
+    }
+    checkManifest(manifest);
+    return { manifest, code };
+  };
+  const blockTag = (manifest, code, disabled) => {
+    checkManifest(manifest);
+    checkCode(code, manifest.id);
+    return `<${SCR} type="mycelium/nodule" data-id="${manifest.id}"`
+      + `${disabled ? ' data-disabled="1"' : ''}>${blockText(manifest, code)}</${SCR}>`;
+  };
+  const blockText = (manifest, code) => `\n/*NODULE*/${JSON.stringify(manifest)}/*CODE*/\n${norm(code)}\n`;
+  const findBlockTags = (html, onError) => {
+    const re = new RegExp(`<${SCR}(\\s[^>]*type="mycelium/nodule"[^>]*)>([\\s\\S]*?)</${SCR}>`, 'g'), out = [];
+    for (const m of html.matchAll(re)) {
+      try {
+        const b = parseBlock(m[2]);
+        if (/data-disabled=/.test(m[1])) b.tagDisabled = true;
+        out.push(b);
+      } catch (e) { if (!onError) throw e; onError(e, (/data-id="([^"]*)"/.exec(m[1]) || [])[1] || '?'); }
+    }
+    return out;
+  };
+  const findLineage = html => {
+    const m = /<!--MYCELIUM-LINEAGE ([\s\S]*?)-->/.exec(html);
+    return m ? JSON.parse(m[1]) : null;
+  };
+
+  // 自报/技能: 块的自我说明(只有注释, 给人看也给 agent 看)
+  //   自报: 头一句用处; 「数据 {…}」认一个数据前缀; 「现在 X」此刻的样子; 「打开 X」点开它时调
+  //   技能: 「// 【名】什么时候读: 做法…」开一条
+  const aboutOf = eff => {
+    const o = { desc: '', data: [], skills: [] }, 段 = n => eff.segs.find(s => s.name === n)?.lines || [];
+    段('自报').slice(1).forEach(l => {
+      const [, k, v] = /^\/\/ (数据|现在|打开) (.*)/.exec(l) || [];
+      if (k === '数据') { try { o.data.push(JSON.parse(v)); } catch (e) { o.data.push({ error: l }); } }
+      else if (k) o[k === '现在' ? 'show' : 'open'] = v.trim();
+      else if (!o.data.length && /^\/\/ \S/.test(l)) o.desc += l.slice(3);
+    });
+    段('技能').forEach(l => {
+      const m = /^\/\/ 【(.+?)】(.*)/.exec(l);
+      if (m) o.skills.push({ name: m[1], when: m[2].split(/[:：。] ?/)[0].slice(0, 40) });
+    });
+    return o;
+  };
+  const borrowTable = () => {
+    const t = {};
+    L.factory.forEach(b => effectiveOf(b).segs.forEach(s => {
+      const k = s.map && s.map.block !== b.manifest.id && s.map.block + '/' + s.map.name;
+      if (k) (t[k] ||= []).push(b.manifest.id);
+    }));
+    return t;
+  };
+  const 谁要 = id => {
+    const q = id === 'hypha' ? parseSegs(stemTextNow()) : effectiveOf(块(id)), R = lay(q, id, 1), out = {},
+      记 = (ns, by) => ns.forEach(n => (out[n] ||= []).includes(by) || out[n].push(by));
+    [stemBlock()].concat(L.factory).forEach(y => effectiveOf(y).segs.forEach(s => {
+      if (s.map?.block !== id || y.manifest.id === id) return;
+      const [r, g] = 连(R, [s.map.name].concat(s.want));
+      记([...r].concat([...g].map(i => q.segs[i].name)), y.manifest.id);
+    }));
+    Object.values(R.need).concat(q.segs.map(s => s.follows)).forEach(ns => 记(ns, id));
+    return out;
+  };
+  const outline = (b, t) => {
+    const id = b.manifest.id, eff = effectiveOf(b), inst = L.inst[id], tab = t || borrowTable();
+    return { id, name: b.manifest.name || id, icon: b.manifest.icon || '', about: aboutOf(eff),
+      version: b.manifest.version || 0, enabled: isEnabled(b), adopted: !!b.adopted, running: !!inst,
+      hidden: inst?.ctx.root?.style.display === 'none', error: L.errors[id] || null,
+      deleted: eff.deleted, segs: eff.segs.map(s => ({ name: s.name, v: s.v, lines: s.lines.length,
+        use: s.use, hasEdit: s.hasEdit, map: s.map, from: s.from, follows: s.follows,
+        borrowers: (tab[id + '/' + s.name] || []).slice() })) };
+  };
+  const 块 = id => blockOf(id) || fail('无此块: ' + id);
+  const 回 = (b, x) => {
+    const e = effectiveOf(b), id = b.manifest.id;
+    return Object.assign({ id, error: L.errors[id] || null, deleted: e.deleted,
+      edited: e.segs.filter(s => s.use === 'edited').map(s => s.name) }, x);
+  };
+  // 预览: 逐段改动和字节差
+  const 预览 = async (A, B) => {
+    const list = e => [{ name: '(前言)', text: e.prologue.join('\n') }].concat(e.segs);
+    const a = list(A), b = list(B), 文 = (xs, n) => xs.find(s => s.name === n)?.text || '', changes = [];
+    for (const name of new Set(a.concat(b).map(s => s.name))) {
+      const before = 文(a, name), after = 文(b, name);
+      if (before !== after) changes.push({ name, bytes: new TextEncoder().encode(after).length
+        - new TextEncoder().encode(before).length });
+    }
+    return { changes, bytes: changes.reduce((n, c) => n + c.bytes, 0) };
+  };
+  const 源头段没了 = async (srcId, removed, oldEff) => {   // 借用方自动得到一份复制并变显性
+    for (const b of L.factory) {
+      const id = b.manifest.id;
+      if (id === srcId) continue;
+      const rec = L.recs[id] || { segs: {} }, eff = effectiveOf(b), have = 有(eff),
+        cut = eff.segs.filter(s => s.map?.block === srcId && removed.includes(s.map.name)
+          && oldEff.segs.some(x => x.name === s.map.name));
+      rec.segs = rec.segs || {};
+      if (!cut.length) continue;
+      copyOf(oldEff, srcId, cut.map(s => [s, s.map.name]), have).forEach((t, i) => {
+        rec.segs[cut[i].name] = 改版(t);
+      });
+      L.recs[id] = rec;
+      await Sub.set(recKey(id), rec, 'hypha');
+      dispose(id); tryRun(b);
+    }
+  };
+  const setNoduleNow = async a => {
+    const id = a.id || fail('缺 id');
+    if (id === 'hypha') return setStem(a);
+    if (!['code', 'enabled', 'segment', 'edits', 'remove', 'hidden'].some(k => a[k] !== undefined))
+      fail('没有要改的内容: 给 code / enabled / segment / edits / remove / hidden 之一');
+    const b = 块(id);
+    if (a.expected !== undefined && a.expected !== revOf(id))
+      fail(`${id} 在你读过之后被改过了, 请重新读一遍再改(基线号对不上)`);
+    if (a.hidden !== undefined && !a.preview) {
+      const inst = L.inst[id];
+      if (inst && inst.ctx.root) inst.ctx.root.style.display = a.hidden ? 'none' : '';
+      if (Object.keys(a).length === 2) { emit('mycelium:blocks'); return 回(b); }
+    }
+    if (L.safe) fail('安全模式只读, 改块无效(?safe=1 中, 或改版内核已连续崩溃被切回原版)');
+    const oldEff = effectiveOf(b), on0 = isEnabled(b);
+    if (a.remove) {
+      if (!b.adopted) fail('只有收养块能移除; 出厂块用 enabled:false 禁用');
+      dispose(id);
+      delete L.recs[id];
+      await Sub.del(recKey(id), 'hypha');
+      L.factory = L.factory.filter(x => x !== b);
+      delete L.errors[id];
+      await 源头段没了(id, oldEff.segs.filter(s => !s.map).map(s => s.name), oldEff);
+      emit('mycelium:blocks');
+      return { id, removed: true };
+    }
+    const prev = clone(L.recs[id]), rec = clone(L.recs[id]) || { segs: {} };
+    rec.segs = rec.segs || {};
+    if (a.code === null) {
+      Object.values(rec.segs).forEach(s => { s.active = 'factory'; });
+      if (rec.order !== undefined || rec.prologue !== undefined) rec.layoutActive = 'factory';
+    } else if (typeof a.code === 'string') {
+      const code = norm(a.code);
+      checkCode(code, id);
+      const fp = parsedOf(b), np = checkSegs(parseSegs(code), id), segs = rec.segs,
+        fnames = fp.segs.map(s => s.name), nnames = np.segs.map(s => s.name),
+        sameOrder = nnames.join('\u0001') === fnames.join('\u0001'),
+        samePro = np.prologue.join('\n') === fp.prologue.join('\n');
+      np.segs.forEach(s => 记(b, rec, s));
+      new Set(fnames.concat(Object.keys(segs))).forEach(n => {
+        if (!nnames.includes(n)) fnames.includes(n) ? (segs[n] = 改版('')) : delete segs[n];
+      });
+      if (sameOrder && samePro) ['order', 'prologue', 'layoutActive'].forEach(k => delete rec[k]);
+      else Object.assign(rec, { order: sameOrder ? undefined : nnames,
+        prologue: samePro ? undefined : np.prologue.join('\n'), layoutActive: 'edited' });
+    } else if (a.code !== undefined) fail('code 只能是字符串(整块改写)或 null(恢复出厂)');
+    applyEdits(b, rec, a.edits || (a.segment ? [a.segment] : []), id);
+    if (a.enabled !== undefined) rec.enabled = !!a.enabled;
+    const eff = effective(parsedOf(b), rec);
+    const run = forRun(id, checkSegs(eff, id));
+    const revision = revOf(id), on1 = rec.enabled === undefined ? on0 : rec.enabled,
+      changed = JSON.stringify(prev || { segs: {} }) !== JSON.stringify(rec),
+      restart = run !== forRun(id, oldEff) || on0 !== on1 || (on1 && !L.inst[id]);
+    checkCode(run, id);
+    syntax(run, '没有改动: 新版本', 块参);      // 语法不过就不动正在跑的那份
+    if (a.preview) return Object.assign({ id, preview: true, revision, changed, restart }, await 预览(oldEff, eff));
+    if (!changed && !restart) return 回(b, { revision, changed, restarted: false });
+    L.recs[id] = rec;
+    const was = !!L.inst[id];
+    if (restart) {
+      dispose(id);
+      try { instantiate(b); }
+      catch (e) {                            // 新版本初始化失败: 回滚旧版
+        if (prev) L.recs[id] = prev; else delete L.recs[id];
+        dispose(id);
+        let back = '';
+        if (was || !isEnabled(b)) { try { instantiate(b); } catch (e2) { back = '; 回滚旧版也失败: ' + e2.message; } }
+        fail('新版本初始化失败, 已回滚: ' + e.message + back);
+      }
+    }
+    if (!on0 && on1) await 认亲([id]);
+    await Sub.set(recKey(id), rec, 'hypha');
+    const removed = oldEff.segs.filter(s => !s.map && !eff.segs.some(n => n.name === s.name)).map(s => s.name);
+    if (removed.length) await 源头段没了(id, removed, oldEff);
+    emit('mycelium:blocks');
+    return 回(b, { revision: revOf(id), changed, restarted: restart });
+  };
+  const QUEUE = {};
+  const setNodule = a => {                   // 同一块的写入排队; 写完照现在谁在跑重剪借用方
+    a = a || {};
+    if (a.preview) return setNoduleNow(a);
+    return QUEUE[a.id] = (QUEUE[a.id] || Promise.resolve()).catch(() => { })
+      .then(() => setNoduleNow(a)).finally(重剪);
+  };
+  // 内核自己也是"一块"(id: hypha): 整段文本, 改完要重载
+  const stemUse = () => LS()?.getItem(BOOT.key + '.use') || 'factory';
+  const stemEdited = () => LS()?.getItem(BOOT.key + '.edited') || '';
+  const stemTextNow = () => (stemUse() === 'edited' && stemEdited()) || L.stemFactory;
+  const stemBlock = () => ({ manifest: { id: 'hypha', name: 'Hypha' }, code: stemTextNow() });
+  const setStem = async a => {
+    if (!LS()) fail('此环境没有 localStorage, 不能改内核');
+    if (a.expected !== undefined && a.expected !== revOf('hypha'))
+      fail('内核在你读过之后被改过了, 请重新读一遍再改');
+    const edits = a.edits || (a.segment ? [a.segment] : []);
+    let edited = stemEdited(), use = stemUse();
+    if (a.code === undefined && a.active === undefined && !edits.length)
+      fail('改内核要给 code(字符串或 null)、segment / edits 或 active');
+    if (a.code === null) use = 'factory';
+    else if (typeof a.code === 'string') [edited, use] = [a.code, 'edited'];
+    else if (a.code !== undefined) fail('code 只能是字符串或 null');
+    if (edits.length) {
+      const rec = { segs: {} };
+      applyEdits(stemBlock(), rec, edits, 'hypha');
+      [edited, use] = [joinSegs(effective(parsedOf(stemBlock()), rec)), 'edited'];
+    }
+    if (a.active !== undefined) {
+      if (a.active !== 'edited' && a.active !== 'factory') fail("active 只能是 'edited' 或 'factory'");
+      if (a.active === 'edited' && !edited) fail('内核没有改版, 无从切换');
+      use = a.active;
+    }
+    if (norm(edited) === norm(L.stemFactory)) [edited, use] = ['', 'factory'];
+    if (use === 'edited') {
+      checkCode(edited, 'hypha');
+      lay(parseSegs(edited), 'hypha');
+      syntax(edited, '没有保存: 改版内核');
+    }
+    const changed = edited !== stemEdited() || use !== stemUse();
+    if (a.preview) return { id: 'hypha', preview: true, revision: revOf('hypha'), changed };
+    if (edited !== stemEdited()) LS().setItem(BOOT.key + '.edited', edited);
+    LS().setItem(BOOT.key + '.use', use);
+    return { id: 'hypha', needReload: changed, use, hasEdit: !!edited, changed };
+  };
+
+  // ══════════ 收养(导入) ══════════
+  // 未知 id 零执行落库、默认禁用; 已知 id 导入版上岗、原来的退成隐性。
+  // 复制用「换」换回借用行, 换不回的保留; 离体占位按号找回。
+  const 在场 = ids => new Set(L.factory.filter(b => isEnabled(b) && (!ids || ids.includes(b.manifest.id)))
+    .map(b => b.manifest.id));
+  const 补 = (code, old) => {
+    const L2 = lay(parseSegs(code), ''), O = lay(parseSegs(old ?? ''), '', 1), at = {}, 缺 = [];
+    Object.entries(L2.处).forEach(([n, i]) => {
+      const j = O.处[n];
+      if (L2.pair[i] !== i + 1) return;      // 导进来的这处有内容: 照它的
+      if (O.pair[j] > j) at[i] = O.lines.slice(j, O.pair[j]);
+      else 缺.push(n);
+    });
+    return { code: L2.lines.flatMap((l, i) => at[i] || [l]).join('\n'), 缺 };
+  };
+  const 隐了 = (b, 隐) => 隐.filter(x => parsedOf(b).segs.some(f => f.name === x.name
+    && segKey(f) !== segKey(parseSegs(x.text).segs[0])));
+  const 认亲 = async ids => {
+    const out = [];
+    for (const b of L.factory.slice()) {
+      const id = b.manifest.id, e = effectiveOf(b), code = joinSegs(e),
+        r = !ids.includes(id) && e.segs.some(s => s.from && ids.includes(s.from.block))
+          && 换(code, id, 在场(ids), null);
+      if (!r || r.code === code) continue;
+      await setNodule({ id, code: r.code, edits: 隐了(b, r.隐) });
+      out.push({ id, result: `源自 ${ids} 的复制换回了借用行, 复制留作隐性改版` });
+    }
+    return out;
+  };
+  const adopt = async a => {
+    if (typeof a?.text !== 'string') fail('adopt 要 {text: 文件内容}');
+    const out = [], bs = findBlockTags(a.text, (e, id) => out.push({ id, result: '✗ 无法解析: ' + e.message }));
+    if (!bs.length && !out.length) fail('未发现 Nodule 块(需要 mycelium/nodule 标签)');
+    for (const b of bs) {
+      const id = b.manifest.id, old = blockOf(id);
+      try {
+        checkCode(b.code, id);
+        checkSegs(parseSegs(b.code), id);
+        const 前 = old && joinSegs(effectiveOf(old)), f = 补(b.code, 前), r = 换(f.code, id, 在场(), null),
+          note = (r.隐.length ? `; ${r.隐.length} 段复制换回了借用行, 复制留作隐性改版` : '')
+            + (r.留.length ? '; 段 ' + r.留.map(([s, w]) => `${s.name}(${w})`).join('、') + ' 保留复制' : '')
+            + (f.缺.length ? `; 少了 ${f.缺.length} 处只在本系统里用的代码(${f.缺.join('、')}), 要完整的请导出带内核的一代` : '');
+        if (old) {
+          const pr = L.recs[id], hadEdit = !!(pr?.segs && Object.values(pr.segs).some(s => s.edited));
+          await setNodule({ id, code: r.code, edits: 隐了(old, r.隐) });
+          out.push({ id, result: (joinSegs(effectiveOf(old)) !== 前
+            ? (hadEdit ? '已导入为显性(原改版已被替换, 出厂原版仍为隐性)' : '已导入为显性(原来的退为隐性)')
+            : '与现有一致, 未变') + note });
+        } else {
+          const rec = { adopted: blockText(b.manifest, r.code), enabled: false, segs: {} };
+          r.隐.forEach(x => { rec.segs[x.name] = { edited: x.text, active: 'factory' }; });
+          L.recs[id] = rec;
+          await Sub.set(recKey(id), rec, 'hypha');
+          L.factory.push({ manifest: b.manifest, code: norm(r.code), adopted: true });
+          L.errors[id] = '已收养(禁用)';
+          out.push({ id, result: '已收养(禁用, 启用后上岗)' + note });
+        }
+      } catch (e) { out.push({ id, result: '✗ 导入失败: ' + e.message }); }
+    }
+    out.push(...await 认亲(bs.map(b => b.manifest.id)));
+    emit('mycelium:blocks');
+    return out;
+  };
+
+  // ══════════ 导出 ══════════
+  const 源 = id => id === 'hypha' ? parseSegs(stemTextNow()) : blockOf(id) && effectiveOf(blockOf(id));
+  const 真 = (o, 在) => {                    // 往上找真源头, 最多 9 层
+    for (let n = 9, t; n-- && !在(o.block) && (t = 源(o.block)?.segs.find(x => x.name === o.name))?.map;)
+      o = t.map;
+    return o;
+  };
+  // 换: 导出时真源头在场就改指, 不在就同源几行合剪一份; 导回(带 = null)时对得上的复制整组换回借用行
+  const 换 = (code, id, 在场, 带, 号 = {}, 不) => {
+    const p = parseSegs(code), have = 有(p), 组 = {}, 隐 = [], 留 = [], 回 = 带 === null,
+      在 = x => x === 'hypha' || 在场.has(x),
+      映 = (s, o) => [headLine({ ...blank(s.name), map: o, v: o.v, want: s.want, ask: s.ask })],
+      由 = (s, o, q = 源(o.block)) => !q ? '源头不在' : !在(o.block) ? '源头已禁用'
+        : !q.segs.some(x => x.name === o.name) && !Object.hasOwn(lay(q, o.block, 1).need, o.name) ? '源头没这名字了'
+          : s.name !== o.name ? '名字和源头的不同' : !s.sum ? '老格式, 请从新版重新导出'
+            : 纹(bodyOf(s)) !== s.sum ? '改过, 已分叉' : '';
+    p.segs.forEach(s => {
+      const o = 回 ? s.from : s.map, t = o && o.block !== id && 真(o, 回 ? () => 0 : 在);
+      if (!t) return;
+      if (回 && s.map) { if (在(o.block)) s.lines = 映(s, o); }
+      else if (回 || !在(t.block)) (组[t.block] ||= []).push([s, 回 ? 由(s, o) : t.name]);
+      else if (t !== o) s.lines = [headLine({ ...s, map: t, from: s.from || { v: s.v, ...o } })];
+    });
+    Object.entries(组).forEach(([k, g]) => {
+      if (!回) {
+        const se = 源(k) || fail(`导出 ${id}: 借的 ${k}/${g[0][1]} 在本系统里不存在, 无法复制`);
+        g.forEach(([s]) => { s.got = 带[id + '/' + s.name] || []; });
+        copyOf(se, k, g, have, 号[id + '/' + g[0][0].name] = [], 不)
+          ?.forEach((t, i) => { g[i][0].lines = t.split('\n'); });
+      } else if (g.some(x => x[1])) g.forEach(([s, w]) => 留.push([s, w || '同组有别的换不回']));
+      else g.forEach(([s]) => { 隐.push({ name: s.name, text: s.text, active: 'factory' }); s.lines = 映(s, s.from); });
+    });
+    return { code: joinSegs(p), 隐, 留 };
+  };
+  const 剪 = (code, solo) => solo ? cutCode(code, null) : code;
+  const exportBlocks = (sel, 在场, 带, solo, st = '', 号) => {
+    const by = {}, out = sel.map(b => {
+      const code = 换(joinSegs(effectiveOf(b)), b.manifest.id, 在场, 带 || {}, 号).code;
+      return { manifest: b.manifest, code: 剪(code, solo), disabled: !isEnabled(b) };
+    });
+    [{ manifest: { id: 'hypha' }, code: st }].concat(out).forEach(e => parseSegs(e.code).segs.forEach(s => {
+      if (s.map) (by[s.map.block + '/' + s.map.name] ||= []).push(e.manifest.id);
+    }));
+    out.forEach(e => {
+      const p = parseSegs(e.code);
+      p.segs.forEach(s => s.map || (s.lines[0] = headLine(Object.assign({}, s,
+        { borrowers: (by[e.manifest.id + '/' + s.name] || []).sort() }))));
+      e.code = joinSegs(p);
+    });
+    return out;
+  };
+  const buildHtml = (head, lineageRaw, stemText, launcher, blocks) => [
+    '<!DOCTYPE html>',
+    '<html lang="zh-CN">',
+    head,
+    '<body>',
+    '<!--MYCELIUM-LINEAGE ' + lineageRaw + '-->',
+    '<div id="mycelium-root"></div>',
+    '<' + SCR + ' id="hypha">' + stemText + '</' + SCR + '>',
+    '<' + SCR + ' id="hypha-launcher">' + launcher + '</' + SCR + '>',
+  ].concat(blocks.map(b => blockTag(b.manifest, b.code, b.disabled || b.tagDisabled)), ['</body>', '</html>']).join('\n');
+  const 拼 = (stemText, blocks, swap, head = L.head, 启 = L.launcher) => {
+    blocks = blocks.map(b => {
+      const p = swap?.id === b.manifest.id && parseSegs(b.code),
+        s = p && p.segs.find(x => x.name === swap.name), h = s && mark(String(swap.text).split('\n')[0]);
+      if (!s) return b;
+      if (!h || h.cut || h.name !== s.name) fail(`swap.text 第一行得是「${s.name}」的段头`);
+      s.lines = String(swap.text).split('\n');
+      return Object.assign({}, b, { code: joinSegs(p) });
+    });
+    const lin = { id: '', parent: BOOT.id, blocks: blocks.map(b => ({ id: b.manifest.id, version: b.manifest.version || 0 })) },
+      body = raw => buildHtml(head, raw, stemText, 启, blocks);
+    lin.id = hash(body(''));
+    return body(JSON.stringify(lin));
+  };
+  const parts = html => {
+    const grab = (re, what) => {
+      const m = re.exec(html);
+      if (!m) fail('文件里找不到 ' + what);
+      return m[1];
+    };
+    return {
+      head: grab(/(<head>[\s\S]*?<\/head>)/, '<head>'),
+      lineageRaw: grab(/<!--MYCELIUM-LINEAGE ([\s\S]*?)-->/, '血统'),
+      stemText: grab(new RegExp('<' + SCR + ' id="hypha">([\\s\\S]*?)</' + SCR + '>'), '内核'),
+      launcher: grab(new RegExp('<' + SCR + ' id="hypha-launcher">([\\s\\S]*?)</' + SCR + '>'), '启动器'),
+      blocks: findBlockTags(html),
+    };
+  };
+  // 门禁: 导出件必须自洽 —— 拆开再拼回一字不差、映射不悬空、语法过、血统对得上
+  const gates = (html, swap, solo) => {
+    const errs = [], p = parts(html), ids = new Set(), dup = new Set(), 名 = {},
+      认 = (id, code) => {
+        try {
+          const q = checkSegs(parseSegs(code), id);
+          名[id] = new Set(q.segs.map(s => s.name).concat(Object.keys(lay(q).need)));
+          try { new Function(...(id === 'hypha' ? [] : 块参), code); }
+          catch (e) {
+            const n = 重名(e), 参 = id !== 'hypha' && 块参错(e);
+            errs.push(id + (参 ? ': ' + 参 : n ? `: 剪进来的代码和它自己的撞名「${n}」, 请改掉一边` : ' 有语法错误: ' + e.message));
+          }
+          return q;
+        } catch (e) { errs.push(id + ': ' + e.message); }
+      };
+    if (buildHtml(p.head, p.lineageRaw, p.stemText, p.launcher, p.blocks) !== html)
+      errs.push('拆开再拼回不一致: 文件里有拼装规则之外的内容');
+    [['hypha', 认('hypha', p.stemText)]].concat(p.blocks.map(b => {
+      const id = b.manifest.id;
+      if (ids.has(id)) dup.add(id);
+      ids.add(id);
+      return [id, 认(id, b.code)];
+    })).forEach(([id, q]) => (q ? q.segs : []).forEach(s => {
+      if (!s.map) return;
+      const at = `${id} 借 ${s.map.block}/${s.map.name}`;
+      if (!名[s.map.block]) errs.push(`悬空映射: ${at}, 但文件里没有 ${s.map.block}`);
+      else if (!名[s.map.block].has(s.map.name)) errs.push(`悬空映射: ${at}, 但它没有这段或范围`);
+      if (!isIdent(s.name)) errs.push(`映射段名不合法: ${id}/${s.name}`);
+      if (s.ask && !名[id].has(s.ask.split('.')[0])) errs.push(`按需写错: ${at} · 按需: ${s.ask}, 它没有这段或范围`);
+      if (s.lines.slice(1).some(l => l.trim())) errs.push(`映射段只能有那一行, 后面不能跟代码: ${id}/${s.name}`);
+    }));
+    dup.forEach(d => errs.push('块 id 重复: ' + d));
+    const lin = JSON.parse(p.lineageRaw), linIds = (lin.blocks || []).map(x => x.id).sort().join(),
+      tagIds = [...ids].sort().join();
+    if (linIds !== tagIds) errs.push(`块清单与血统不一致: 血统 [${linIds}] 文件 [${tagIds}]`);
+    if (errs.length) fail('门禁未过:\n' + errs.join('\n'));
+    return true;
+  };
+  // 导出: ids 不给 = 启用着的; stem:false = 离体(只带名单上的块借的内核范围)
+  const molt = a => {
+    const { ids, swap, 带 = {} } = a || {}, solo = a?.stem === false, 号 = {};
+    (ids || []).forEach(i => blockOf(i) || fail('无此块: ' + i));
+    const sel = L.factory.filter(b => ids ? ids.includes(b.manifest.id) : isEnabled(b)),
+      在场 = new Set(solo ? [] : sel.map(b => b.manifest.id)),
+      门 = (st, bs, n) => {
+        const h = 拼(st, bs, swap, n ? L.head.replace(/<title>[^<]*/, () => '<title>' + n.replace(/[<&]/g, ''))
+          : L.head, solo ? '' : L.launcher);
+        gates(h, swap, solo);
+        return h;
+      };
+    if (!solo) {
+      const st = 换(stemTextNow(), 'hypha', 在场, 带).code;
+      return 门(st, exportBlocks(sel, 在场, 带, false, st), !sel.length && 'Hypha');
+    }
+    const bs = exportBlocks(sel, 在场, 带, true, '', 号), want = new Set();
+    bs.forEach(e => parseSegs(e.code).segs.forEach(s => {
+      if (s.map && s.map.block === 'hypha') [s.map.name].concat(s.want).forEach(n => want.add(n));
+    }));
+    if (!want.size) fail('名单里没有内核, 块也没借内核的代码, 这样的文件打开跑不起来。在块里加一行: // ↦ 借 hypha 的 离体运行时');
+    const stem = 换(cutCode(stemTextNow(), [...want], 'Hypha', 号.hypha = []), 'hypha', 在场, 带).code;
+    syntax(stem, '内核只留 [' + [...want] + '] 剪出来的那份');
+    bs.forEach(x => { x.disabled = false; });
+    const h = 门(stem, bs, bs.map(b => b.manifest.name || b.manifest.id).join(' + '));
+    return a.号 ? { html: h, 号 } : h;
+  };
+  // 「按需: 段.项」从借用方自己的段值表取: 函数就调用、Promise 就等; 没在跑的当空
+  const 问 = async bs => {
+    const 带 = {};
+    for (const b of bs) for (const s of effectiveOf(b).segs) {
+      const id = b.manifest.id, [d, n] = (s.ask || '').split('.');
+      if (s.map && s.ask && L.inst[id]) 带[id + '/' + s.name] = await Promise.resolve().then(() => {
+        const v = SEG[id + '/' + d];
+        if (v == null || !(n in Object(v))) fail(`${id} 没有 ${s.ask}`);
+        return typeof v[n] === 'function' ? v[n]() : v[n];
+      }).then(x => [].concat(x || []), e => new Error('按需 ' + id + '/' + s.ask + ': ' + e.message));
+    }
+    return 带;
+  };
+
+  // ══════════ 隔离窗 ══════════
+  // 宿主和 iframe 跑同一段 peer 代码, 流式因此天然双向。
+  // 消息: 请求 {seq,path,args} / 分片 {seq,chunk} / 结束 {seq,done,result|error} / 握手 {hello}
+  function peer(chan, post, onCall, onHello) {
+    let seq = 0, disposed = false;
+    const wait = {}, end = (s, o) => post(Object.assign({ __myc: chan, seq: s, done: true }, o));
+    const call = (path, args, onChunk) => new Promise((res, rej) => {
+      if (disposed) return rej(new Error('实例已卸载'));
+      const s = ++seq;
+      wait[s] = { res, rej, onChunk };
+      try { post({ __myc: chan, seq: s, path, args: args ?? {}, stream: !!onChunk }); }
+      catch (e) { delete wait[s]; rej(e); }
+    });
+    const recv = async d => {
+      if (!d || d.__myc !== chan || disposed) return;
+      if (d.hello) return onHello && onHello();
+      if (d.path) {
+        try {
+          let r = await onCall(d.path, d.args);
+          if (r && typeof r[Symbol.asyncIterator] === 'function') {
+            const it = r[Symbol.asyncIterator]();
+            for (; ;) {
+              if (disposed) { try { await it.return(); } catch (_) { } return end(d.seq, { error: '实例已卸载, 流已取消' }); }
+              const n = await it.next();
+              if (n.done) { r = n.value; break; }
+              post({ __myc: chan, seq: d.seq, chunk: n.value });
+            }
+          }
+          end(d.seq, { result: r ?? null });
+        } catch (e) { try { end(d.seq, { error: e?.message || String(e) }); } catch (_) { } }
+        return;
+      }
+      const w = wait[d.seq];
+      if (!w) return;
+      if (!d.done) return w.onChunk && w.onChunk(d.chunk);
+      delete wait[d.seq];
+      if (d.error) w.rej(new Error(d.error)); else w.res(d.result);
+    };
+    return {
+      call, recv, hello: () => post({ __myc: chan, hello: true }),
+      dispose: () => {
+        disposed = true;
+        Object.keys(wait).forEach(s => { wait[s].rej(new Error('实例已卸载')); delete wait[s]; });
+      },
+    };
+  }
+  // 窗里那一头: colony.某.某(参数) 就是 call('某.某', 参数)
+  function glue(chan, context) {
+    const exposed = {}, p = peer(chan, m => parent.postMessage(m, '*'), (path, args) => {
+        const f = exposed[path];
+        if (!f) throw new Error('孢子未暴露: ' + path);
+        return f(args);
+      }), call = (path, args, onChunk) => p.call(path, args, onChunk), go = () => p.hello(),
+      no = k => typeof k !== 'string' || k === 'then' || k === 'toJSON';
+    window.addEventListener('message', e => { if (e.source === parent) p.recv(e.data); });
+    window.mycelium = new Proxy({ call, callStream: call, expose: (n, f) => { exposed[n] = f; }, context }, {
+      get: (t, ns) => no(ns) || ns in t ? t[ns] : new Proxy({}, {
+        get: (_, m) => no(m) || m === 'toString' || m === 'valueOf' ? undefined : (a, c) => call(ns + '.' + m, a, c),
+      }),
+    });
+    if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', go); else go();
+    window.dispatchEvent(new Event('mycelium:ready'));
+  }
+  const iframeGlue = (chan, context) => `(function(){${peer};(${glue})(${JSON.stringify(chan)},`
+    + `${JSON.stringify(context || {}).replace(/</g, '\\u003c')})})();`;
+  // 挂载: iframe sandbox, 握手后才算就绪; 权限增量归调用方(宿主不给的, 孢子要不到)
+  const mount = async opts => {
+    const f = doc().createElement('iframe'), chan = 'c' + Math.random().toString(36).slice(2, 9),
+      context = opts.context || {}, attrs = {}, ms = opts.timeout || 8000;
+    Object.keys(opts.attrs || {}).forEach(k => { attrs[k.toLowerCase()] = opts.attrs[k]; });
+    f.setAttribute('sandbox', [...new Set(['allow-scripts', 'allow-forms', 'allow-modals', 'allow-popups',
+      'allow-downloads'].concat(String(attrs.sandbox || '').split(/\s+/)))].filter(Boolean).join(' '));
+    Object.keys(attrs).forEach(k => { if (k !== 'sandbox') f.setAttribute(k, String(attrs[k])); });
+    f.dataset.mycApp = chan;
+    if (context.sporeId) f.dataset.spore = context.sporeId;
+    f.style.cssText = opts.hidden ? 'display:none' : 'border:0;width:100%;height:100%';
+    let ready = false, done;
+    const p = peer(chan, m => { if (f.contentWindow) f.contentWindow.postMessage(m, '*'); },
+        (path, args) => Net.call(path, args, { frame: f, context }), () => { ready = true; if (done) done(); }),
+      onMsg = e => { if (e.source === f.contentWindow) p.recv(e.data); };
+    win().addEventListener('message', onMsg);
+    f.myc = { call: p.call, context, destroy: () => {
+      win().removeEventListener('message', onMsg); p.dispose(); f.remove();
+    } };
+    const script = `<${SCR}>${iframeGlue(chan, context)}</${SCR}>`,
+      html = String(opts.code);
+    f.srcdoc = /^\s*<!doctype|<head[\s>]/i.test(html)
+      ? html.replace(/^\s*<!doctype[^>]*>|<head(\s[^>]*)?>/i, m => m + script) : script + html;
+    (opts.host || doc().body).appendChild(f);
+    await new Promise((res, rej) => {
+      done = res;
+      E.setTimeout(() => ready || rej(Object.assign(new Error(`孢子未就绪(${ms / 1000}s 内没有握手): 它的脚本可能在注入代码之前就出错了`), { frame: f })), ms);
+    });
+    return f;
+  };
+  P('hypha.mount', a => mount(a), '在隔离窗里跑一段 HTML, 握手后返回 iframe',
+    { code: 'string', host: 'string?', hidden: 'boolean?', attrs: 'object?', context: 'object?', timeout: 'number?' }, false, 'guarded');
+  P('hypha.unmount', a => { 帧Of(a.frame).myc.destroy(); return true; }, '销毁隔离窗', { frame: 'string' }, false, 'guarded');
+  P('hypha.frames', () => apps().map(f => ({ frame: f.dataset.mycApp, sporeId: f.dataset.spore || null,
+    alive: f.isConnected, context: f.myc?.context || {} })), '活着的隔离窗', {}, false);
+  P('hypha.invoke', a => 帧Of(a.frame).myc.call(a.path, a.args), '反向调用孢子暴露的能力',
+    { frame: 'string', path: 'string', args: 'object?' }, false, 'guarded');
+  const apps = () => doc() ? [...doc().querySelectorAll('iframe[data-myc-app]')] : [];
+  const 帧Of = id => apps().find(f => f.dataset.mycApp === id)
+    || apps().filter(f => f.dataset.spore === id).pop() || fail(`无此运行帧: ${id}(用 hypha.frames 里的 frame 或 sporeId)`);
+
+  // ══════════ 内核自己的能力 ══════════
+  P('hypha.nodules', () => {
+    const t = borrowTable();
+    return L.factory.map(b => outline(b, t)).concat(L.broken.map(x => ({ id: x.id, error: x.error, broken: true })));
+  }, '列块, 含每块的段目录; broken 是解析不了的块', {});
+  P('hypha.nodule', a => {
+    const id = a.id, hypha = id === 'hypha', b = hypha ? stemBlock() : 块(id), eff = effectiveOf(b),
+      o = { id, revision: revOf(id) };
+    if (a.segment) {
+      const s = eff.segs.find(x => x.name === a.segment) || fail('无此段: ' + a.segment);
+      o.segment = { name: s.name, text: s.text, use: hypha ? stemUse() : s.use };
+      if (a.factory && s.factoryText !== s.text) o.segment.factory = s.factoryText;
+      return o;
+    }
+    Object.assign(o, outline(b), { need: 谁要(id) }, hypha ? { running: true, use: stemUse(), hasEdit: !!stemEdited() } : {});
+    if (a.full) Object.assign(o, { code: joinSegs(eff), factory: hypha ? L.stemFactory : b.code });
+    return o;
+  }, '读一块: 默认段目录(need 谁要哪个名字), full 取全文, segment 只回那一段(factory: true 同时要原版); id 可为 hypha',
+    { id: 'string', full: 'boolean?', segment: 'string?', factory: 'boolean?' });
+  P('hypha.catalog', (a, m) => Net.catalog(m.by).filter(c => !a.path || c.path.startsWith(a.path)),
+    '能力清单与参数形状(块调时带上它自己名下的); 给 path 只列这个前缀的', { path: 'string?' });
+  P('hypha.setNodule', a => setNodule(a),
+    '唯一写入口。回 changed / restarted / revision; edited / deleted 是和出厂版比',
+    { id: 'string', code: 'string|null?(整块改写; null = 恢复出厂)', enabled: 'boolean?',
+      segment: 'object?(segment.edits 同 edits)', edits: 'array?(一次改几段, 全成或全不动)',
+      preview: 'boolean?(只回每段的改动, 不写不重启)', expected: 'string?(读到的 revision; 对不上就拒绝)',
+      remove: 'boolean?', hidden: 'boolean?', active: 'string?' }, false, 'guarded');
+  P('hypha.adopt', a => adopt(a), '导入 Nodule: 未知 id 收养禁用, 已知 id 导入为显性', { text: 'string' }, false, 'guarded');
+  P('hypha.build', async a => {
+    const 带 = await 问(L.factory), x = a.假如, 原 = x && L.recs[x.id];
+    if (x) {
+      const rec = clone(原) || { segs: {} };
+      rec.segs ||= {};
+      applyEdits(块(x.id), rec, x.edits, x.id);
+      L.recs[x.id] = rec;
+    }
+    try { return molt(Object.assign({}, a, { 带: { ...带, ...(a.带 || {}) } })); }
+    finally { if (x) 原 ? L.recs[x.id] = 原 : delete L.recs[x.id]; }
+  }, '导出: 给一张名单, 返回 HTML, 门禁不过则报错。stem: false = 离体(只带名单上的块借的内核范围)',
+    { ids: 'string[]?(不给 = 启用着的块)', stem: 'boolean?',
+      swap: 'object?(这一块的这一段在导出件里换成 text, 本机什么都不动)',
+      假如: 'object?(当这块已经照 edits 改了再导出, 本机什么都不动)' }, false, 'notice');
+  P('hypha.reboot', async () => {
+    Object.keys(L.inst).forEach(dispose);
+    await assembleAll();
+    return { running: Object.keys(L.inst) };
+  }, '软重启: 卸全部块再装', {}, false, 'notice');
+  P('hypha.lineage', () => ({ id: BOOT.id, lineage: BOOT.lineage, safe: L.safe, solo: BOOT.solo }),
+    '本文件的指纹、父指纹、块清单', {});
+  P('hypha.snapshots', async () => Sub.snapshots(), '列整库快照', {});
+  P('hypha.snapshot', async a => {
+    if (a.restore) return Sub.restore(a.name);
+    if (a.drop) { await Sub.drop(a.name); return Sub.snapshots(); }
+    return Sub.snapshot(a.name);
+  }, '整库快照: 给 name 拍一张; restore 回滚(之后要 hypha.reboot 块才重装); drop 删。列快照用 hypha.snapshots',
+    { name: 'string?', restore: 'boolean?', drop: 'boolean?' }, false, 'guarded');
+  P('hypha.journal', a => Sub.read(a || {}), '事件日志: 谁在什么时候写了什么(审计)',
+    { since: 'number?', limit: 'number?' });
+  P('hypha.trace', a => Net.trace(a || {}), '能力调用记录: path / by / ms / ok(示波器看这个)',
+    { path: 'string?', by: 'string?', limit: 'number?' });
+  P('hypha.approve', a => {
+    const ok = Net.decide(a.id, a.ok, a.remember);
+    if (!ok) fail(`没有待审批的请求 ${a.id}(可能已超时被拒)`);
+    return { decided: a.id, ok: !!a.ok };
+  }, '批准或拒绝一个 guarded 能力的调用(界面用)', { id: 'string', ok: 'boolean?', remember: 'boolean?' }, false);
+  P('hypha.pending', () => [...Net.pending.values()].map(p => p.req), '待审批的 guarded 调用', {});
+  P('hypha.autonomy', a => {
+    if (a.level) {
+      if (!['ask', 'remember', 'auto'].includes(a.level)) fail("autonomy 只能是 ask / remember / auto");
+      Net.autonomy = a.level;
+      if (a.level === 'ask') Net.remembered.clear();
+      Sub.set('settings:net.autonomy', a.level, 'hypha');
+    }
+    return { autonomy: Net.autonomy, remembered: [...Net.remembered] };
+  }, 'agent 自主度: ask 每次问 / remember 记住选择 / auto 不拦(改代码、花钱前想清楚)',
+    { level: 'string?' }, false, 'notice');
+
+  // ══════════ 裸壳面板 ══════════
+  // 没有桌面块时的兜底: 只走能力网, 保证系统永远可操作(能启用块、改内核、导入导出)
+  const PANEL_CSS = `.k-panel{max-width:760px;margin:48px auto;padding:0 20px;font:14px/1.6 -apple-system,"PingFang SC",sans-serif}
+.k-panel h1{font-size:20px;margin:0 0 4px}.k-sub{color:#8a8a8a;font-size:12px;margin-bottom:24px}
+.k-block{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:12px 14px;border:1px solid rgba(255,255,255,.09);border-radius:10px;margin-bottom:10px}
+.k-block .nm{font-weight:600}.k-block .meta{color:#8a8a8a;font-size:11px}.k-block .sp{flex:1}
+.k-tag{font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(126,231,135,.12);color:#7ee787}
+.k-tag.warn{background:rgba(245,166,35,.12);color:#f5a623}.k-tag.err{background:rgba(255,87,87,.12);color:#ff5757}
+.k-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);color:#fafafa;border-radius:7px;padding:5px 10px;font-size:12px;cursor:pointer}
+.k-btn:hover{border-color:#7ee787;color:#7ee787}.k-acts{margin-top:20px;display:flex;gap:10px;flex-wrap:wrap}
+.k-msg{margin-top:14px;font-size:12px;color:#8a8a8a;white-space:pre-wrap}.k-msg.err{color:#ff5757}
+.k-banner{background:#3a2a00;color:#ffd60a;padding:8px 14px;font-size:13px}`;
+  const 面板 = {
+    画(el) {
+      el.innerHTML = `<style>${PANEL_CSS}</style><div class="k-panel">
+<h1>🧬 Mycelium · 裸壳面板</h1>
+<div class="k-sub">没有界面块在跑(或它坏了), 这是内核自带的兜底面板: 只走能力网, 系统永远可操作。</div>
+<div class="k-blocks"></div>
+<div class="k-acts">
+  <button class="k-btn" data-a="import">导入块/文件</button>
+  <button class="k-btn" data-a="export">导出整个系统</button>
+  <button class="k-btn" data-a="reboot">软重启</button>
+</div>
+<div class="k-msg"></div></div>`;
+      const 话 = (m, err) => { const q = el.querySelector('.k-msg'); q.textContent = m; q.className = 'k-msg' + (err ? ' err' : ''); };
+      const 列 = async () => {
+        const bs = await Net.call('hypha.nodules', {}, { by: 'panel' });
+        el.querySelector('.k-blocks').innerHTML = bs.map(b => `<div class="k-block" data-id="${b.id}">
+<span>${b.icon || '▪'}</span><span class="nm">${esc(b.name || b.id)}</span>
+<span class="meta">${b.id} v${b.version} · ${b.segs?.length || 0} 段</span>
+${b.broken ? '<span class="k-tag err">坏</span>' : b.running ? '<span class="k-tag">跑着</span>'
+            : `<span class="k-tag warn">${esc(b.error || '停')}</span>`}
+<span class="sp"></span>
+${b.broken || b.adopted || b.id === 'hypha' ? '' :
+            `<button class="k-btn" data-a="toggle">${b.enabled ? '禁用' : '启用'}</button>`}
+<button class="k-btn" data-a="read">读一段</button></div>`).join('') || '<div class="k-sub">一个块都没有</div>';
+      };
+      el.addEventListener('click', async e => {
+        const b = e.target.closest('.k-block'), 钮 = e.target.closest('.k-btn');
+        if (!钮) return;
+        const a = 钮.dataset.a;
+        if (a === 'toggle' && b) {
+          const x = (await Net.call('hypha.nodules', {}, { by: 'panel' })).find(y => y.id === b.dataset.id);
+          await Net.call('hypha.setNodule', { id: b.dataset.id, enabled: !x.enabled }, { by: 'panel' });
+          列();
+        }
+        if (a === 'read' && b) {
+          const n = prompt('读哪段? 留空看目录');
+          if (n === null) return;
+          const r = n ? await Net.call('hypha.nodule', { id: b.dataset.id, segment: n }, { by: 'panel' })
+            : await Net.call('hypha.nodule', { id: b.dataset.id }, { by: 'panel' });
+          话(JSON.stringify(r, null, 1).slice(0, 4000));
+        }
+      });
+      el.querySelector('.k-acts').addEventListener('click', async e => {
+        const 钮 = e.target.closest('.k-btn'); if (!钮) return;
+        try {
+          if (钮.dataset.a === 'export') {
+            const html = await Net.call('hypha.build', {}, { by: 'panel' });
+            const a2 = doc().createElement('a');
+            a2.href = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+            a2.download = 'mycelium.html'; a2.click();
+            话('导出好了: mycelium.html');
+          }
+          if (钮.dataset.a === 'import') {
+            const i = doc().createElement('input');
+            i.type = 'file'; i.accept = '.html,.js,.txt';
+            i.onchange = async () => {
+              const t = await i.files[0].text();
+              话(JSON.stringify(await Net.call('hypha.adopt', { text: t }, { by: 'panel' }), null, 1));
+              列();
+            };
+            i.click();
+          }
+          if (钮.dataset.a === 'reboot') { await Net.call('hypha.reboot', {}, { by: 'panel' }); 话('重启好了'); }
+        } catch (err) { 话(err.message, true); }
+      });
+      列();
+      on('mycelium:blocks', 列);
+      return () => { };
+    },
+  };
+  P('hypha.panel', a => {
+    let host = a?.host;
+    if (!host?.appendChild) {                     // 没给宿主: 自带一个壳(壳有标记, 重新装配时撤掉)
+      host = doc().createElement('div');
+      host.setAttribute('data-k-panel', '1');
+      (doc().getElementById('mycelium-root') || doc().body).appendChild(host);
+    }
+    面板.画(host);
+    return true;
+  }, '把裸壳面板画进 host(桌面块的设置窗用它; 不给就画在页面根部)', { host: {} }, false);
+
+  // ══════════ 启动 ══════════
+  const BOOT = { id: 'dev', lineage: null, solo: false, key: 'mycelium.dev' };
+  const banner = text => {
+    const d = doc();
+    if (d?.body) d.body.prepend(Object.assign(d.createElement('div'), { className: 'k-banner', textContent: text }));
+  };
+  const boot = async env => {
+    E = env;
+    Object.assign(BOOT, env.boot || {});
+    try {
+      await Sub.open('mycelium@' + BOOT.id);
+      if (Sub.warn) banner(`存储打不开(${Sub.warn}), 这次的改动不会保存`);
+      if (doc()) {
+        L.head = doc().head.outerHTML.replace(/<style\b[^>]*>[\s\S]*?<\/style>\s*/gi,
+          m => m.includes('裸壳页自用样式') ? m : '');
+        L.launcher = (doc().getElementById('hypha-launcher') || {}).textContent || '';
+        L.stemFactory = (doc().getElementById('hypha') || {}).textContent || '';
+      }
+      // 跑在别的 Mycelium 的隔离窗里: 本机没有的能力问外面那座桥
+      try {
+        const p = win()?.parent;
+        if (p && p !== win() && p.mycelium?.expose) Net.外 = p.mycelium;
+      } catch (_) { }
+      if (BOOT.safe) banner('安全模式: 已忽略全部改版与收养, 跑的是原版内核(?safe=1)');
+      const a = await Sub.get('settings:net.autonomy');
+      if (a) Net.autonomy = a;
+      await assembleAll();
+      if (Net.外) Net.外.expose('call', a2 => Net.call(a2.path, a2.args));
+      try { LS()?.setItem(BOOT.key + '.crash', '0'); } catch (_) { }
+      if (doc() && !env.boot.headless && !Net.has('ui.host')) {   // 没有界面块: 内核兜底面板, 系统永远可操作
+        const host = doc().getElementById('mycelium-root') || doc().body,
+          壳 = doc().createElement('div');
+        壳.setAttribute('data-k-panel', '1');       // 标记打在壳上(不是根): 重新装配时撤壳, 别动根
+        host.appendChild(壳);
+        面板.画(壳);
+      }
+    } catch (e) { banner('启动失败: ' + e.message); throw e; }
+  };
+  const reboot = async () => {
+    Object.keys(L.inst).forEach(dispose);
+    await assembleAll();
+    return { running: Object.keys(L.inst) };
+  };
+
+  // ══════════ 离体运行时 ══════════
+  // 块加一行 // ↦ 借 hypha 的 离体运行时, 就能被导出成独立文件(孢子导出)。
+  // 离体文件里只有这一运行时: 内存 kv + 最小能力网 + 段值表 + 自启动。
+  // 块的代码因此要能在两种环境下都跑: 整系统里用完整内核, 离体时用这一份 ——
+  // 要存东西的只在内存里, 要调别的块的能力会收到清楚的错(它不在)。
+  // ✂ 离体运行时
+  const 离体运行时 = (() => {
+    const mem = new Map(), 拷 = x => x == null ? x : JSON.parse(JSON.stringify(x));
+    const kv = {
+      get: async k => mem.has(k) ? 拷(mem.get(k)) : null,
+      set: async (k, v) => { mem.set(k, 拷(v)); },
+      del: async k => { mem.delete(k); },
+      list: async p => [...mem].filter(([k]) => !p || k.startsWith(p)).map(([key, value]) => ({ key, value: 拷(value) })),
+    };
+    const CAP = {};
+    const net = {
+      provide: (path, fn, meta = {}, by = '离体') => { CAP[path] = { fn, by }; },
+      call: (path, args) => new Promise((res, rej) => {
+        const c = CAP[path];
+        if (!c) return rej(new Error(`离体文件里没有能力 ${path}: 它要整系统里的别的块, 把那份 Mycelium 也带上`));
+        Promise.resolve().then(() => c.fn(args || {}, {})).then(res, rej);
+      }),
+      has: path => !!CAP[path],
+      catalog: () => Object.keys(CAP).sort().map(p => ({ path: p, by: CAP[p].by })),
+    };
+    const SEG2 = {};
+    const segRef = key => new Proxy(function () { }, {
+      get: (_, p) => (typeof p === 'string' && p !== 'then') ? SEG2[key]?.[p] : undefined,
+      apply: (_, t, a) => SEG2[key]?.apply(t, a),
+      construct: (_, a) => Reflect.construct(SEG2[key], a),
+    });
+    const ctxFor = id => {
+      const cleanups = [];
+      const ctx = { id, root: null, kv, provide: net.provide, call: net.call, has: net.has,
+        on: () => () => { }, cleanup: fn => cleanups.push(fn), trace: () => { },
+        log: (...a) => console.log('[' + id + ']', ...a) };
+      return { ctx, cleanups, colony: { call: ctx.call, has: ctx.has, get solo() { return true; } } };
+    };
+    const 析 = text => {
+      const m = /\/\*NODULE\*\/([\s\S]*?)\/\*CODE\*\//.exec(text)
+        || /^\/\/ @nodule (\{[\s\S]*?\})\s*\n/.exec(text);
+      if (!m) throw new Error('块缺少 /*NODULE*/ 清单头');
+      const manifest = JSON.parse(m[1].trim());
+      const code = m[0].startsWith('/*NODULE*/') ? text.slice(m.index + m[0].length) : text.slice(m[0].length);
+      return { manifest, code: String(code).replace(/^\s*\n/, '').replace(/\s+$/, '') };
+    };
+    let 启过 = false;
+    const boot = () => {
+      if (启过 || typeof document === 'undefined') return;
+      if (typeof window !== 'undefined' && window.mycelium && window.mycelium.net) return;   // 整系统在跑, 不抢
+      启过 = true;
+      document.querySelectorAll('script[type="mycelium/nodule"]').forEach(el => {
+        try {
+          const b = 析(el.textContent), o = ctxFor(b.manifest.id), 段 = {
+            set: (n, get) => Object.defineProperty(SEG2, b.manifest.id + '/' + n, { get, configurable: true }),
+            ref: k => segRef(k), clear: () => { },
+          };
+          new Function('ctx', '__seg', 'colony', b.code)(o.ctx, 段, o.colony);
+        } catch (e) { console.error('[离体]', b0(el), e); }
+      });
+      function b0(el) { return el.getAttribute('data-id') || '?'; }
+    };
+    if (typeof document !== 'undefined') {
+      // 等当前这批脚本执行完再判断: 整系统的内核那时已经设好 window.mycelium, 这里就不抢了
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+      else setTimeout(boot, 0);
+    }
+    return { kv, net, SEG: SEG2, segRef, ctxFor, boot };
+  })();
+  // 整系统里也登记: 块离体导出后, 这一行还在, 指着同一份运行时
+  if (typeof SEG !== 'undefined') SEG['hypha/离体运行时'] = 离体运行时;
+  // ✂ 离体运行时 完
+
+  // ══════════ 对外 ══════════
+  g.mycelium = {
+    boot, reboot,
+    get env() { return E; },
+    net: Net, sub: Sub,
+    // 测试与调试用: 内核机制不藏
+    internals: { parseSegs, joinSegs, lay, pick, cutCode, copyOf, effective, mark, headLine, segKey, 换, 连,
+      checkShape, 正化 },
+  };
+  // 单独打开的文件(离体)也有全局入口
+  if (typeof window !== 'undefined') {
+    window.mycelium = g.mycelium;
+    window.myc = { call: (p, a) => Net.call(p, a, { by: 'window' }), has: p => Net.has(p) };
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script id="hypha-launcher">
+/* 启动器: 全文件唯一物理不可改的代码。
+   职责只有三件: 认血统(指纹)、注入 env、调 boot。
+   内核(hypha)是可改的"一块", 启动器不是 —— 改内核改坏了, 刷新还能从这里重新起来。 */
+(function () {
+  'use strict';
+  var m = /<!--MYCELIUM-LINEAGE ([\s\S]*?)-->/.exec(document.documentElement.outerHTML), lin = null;
+  try { lin = m && JSON.parse(m[1]); } catch (e) { }
+  var id = (lin && lin.id) || 'dev', key = 'mycelium.' + id;
+  // 崩溃计数: 连续启动失败 3 次 → 安全模式(忽略全部改版), 改版内核连续崩也能退回原版
+  var S = null, crash = 0, use = null, ed = null, safe = false;
+  try {
+    S = localStorage;
+    crash = +S.getItem(key + '.crash') || 0;
+    use = S.getItem(key + '.use');
+    ed = S.getItem(key + '.edited');
+    S.setItem(key + '.crash', String(crash + 1));
+  } catch (e) { }
+  var solo = !document.getElementById('hypha');        // 离体文件: 没有内核, 块自己带剪来的内核范围
+  if (crash >= 3) {
+    safe = true;
+    if (use === 'edited' && !solo) { try { S.setItem(key + '.use', 'factory'); } catch (e) { } }
+  }
+  if (/[?&]safe=1/.test(location.search)) safe = true;
+  var env = {
+    doc: document,
+    win: window,
+    ls: S,
+    idb: typeof indexedDB !== 'undefined' ? indexedDB : null,
+    fetch: window.fetch.bind(window),
+    setTimeout: window.setTimeout.bind(window),
+    clearTimeout: window.clearTimeout.bind(window),
+    boot: { id: id, lineage: lin, solo: solo, safe: safe, key: key },
+  };
+  if (solo) {
+    // 离体: 内核范围已被剪进文件(Stem 标签里只有需要的几段), 整份就是内核
+    var el = document.getElementById('hypha');
+    (0, eval)(el ? el.textContent : '');
+  }
+  window.mycelium.boot(env);
+})();
+
+</script>
+<script type="mycelium/nodule" data-id="agent">
+/*NODULE*/{"id":"agent","name":"全能 agent","icon":"🤖","version":1,"caps":["agent"]}/*CODE*/
+'use strict';
+// ↦ 借 hypha 的 离体运行时
+// ══════════ 自报 ══════════
+// 你说要做什么, 它就用看、写、改、跑替你去做: 各块的能力它都能调, 块的源码它也能改
+// 数据 {"prefix": "agent.会话", "label": "会话记录", "kind": "data", "edit": "agent.remove"}
+// 数据 {"prefix": "agent.设置", "label": "agent 设置", "kind": "config"}
+// 数据 {"prefix": "ref:", "label": "对话里的附件", "kind": "data"}
+// 现在 agent.prompt
+// 打开 agent.open
+// ══════════ 技能 ══════════
+// 只写猜不到的事实, 只有注释、不跑
+// 【改块】要改哪个块的代码时: 先 hypha.nodule {id} 看段目录, 再 hypha.nodule {id, segment: 名} 读那一段;
+//   改先带 preview 看改了哪些段, 再真写; replace 只换段里和 old 一字一差的那一处, 比整段重写稳;
+//   语法过了不算数, 改完真调一次验证行为, 不对就改回去。新块的清单要写 caps(它登记的能力路径头一截)。
+// 【看界面】要看用户眼前有什么、替他点桌面上的东西时: ui.state 看眼前是什么, ui.do {target, action} 做。
+// 【存数据】用户说了以后都要这样的偏好: data.set 把 agent.记忆 重写成合并后的简短版(400 字内)。
+// ══════════ 状态 ══════════
+const AG = {
+  忙: false, sid: '', 会话表: [], hist: [], 插话: [], 中断: null,
+  预算: 120000,           // 上下文预算(本地按 1 字 ≈ 1 token 粗估), agent.设置.ctxBudget 能改
+  最多轮: 50, 结果上限: 20000, 重试等: [2000, 5000, 10000], 工具等: 600000,
+  底: 0, 用: 0, 没压: '',
+};
+const 键 = k => 'agent.' + k;
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// ══════════ 工具表 ══════════
+// 常用的能力(common)直接当工具发给模型; 其余的进目录, 模型用 call {path, args} 调。
+// 工具名里的 __ 就是路径里的点(hypha__nodule 即 hypha.nodule), 参数形状一起发给它。
+const 工具表 = {
+  目录: [],
+  async list() {
+    const caps = await ctx.call('hypha.catalog');
+    工具表.目录 = caps.filter(c => !c.common).map(c => c.path + ': ' + (c.desc || '').slice(0, 60));
+    return caps.filter(c => c.common).map(c => ({
+      name: c.path.replace(/\./g, '__'),
+      description: (c.desc || '') + (c.args ? ` 参数: {${c.args}}` : ''),
+      parameters: { type: 'object', properties: {} },
+    }));
+  },
+};
+// ══════════ 系统提示 ══════════
+// 每轮发给模型的规矩。改这段就改了 agent 的规矩( hypha.nodule {id:'agent', segment:'系统提示'} 能改、能换回)。
+// 原文加工具清单见 agent.prompt 能力。透明: 用户就是开发者, 有权看这一切。
+const 系统提示 = async () => {
+  let blocks = '';
+  try {
+    blocks = (await ctx.call('hypha.nodules')).map(b => {
+      if (b.broken) return `${b.id}(坏了: ${b.error})`;
+      const a = b.about || {}, 技 = a.skills || [];
+      return `${b.id} ${b.name}${b.running ? '' : `(${b.error || '没在跑'})`}`
+        + (a.desc ? ': ' + a.desc : '')
+        + (技.length ? ' · 技能: ' + 技.map(s => `${s.name}(${s.when})`).join('、') : '');
+    }).join('\n');
+  } catch (e) { blocks = `(读不到块清单: ${e.message})`; }
+  const 读 = async k => String((await ctx.kv.get(k)) || '').trim();
+  const 备 = 键('备忘.' + AG.sid);
+  const memo = await 读(键('记忆')), 忘 = await 读(备);
+  return [
+    '你是 Mycelium 的全能 agent。Mycelium 是一个 html 文件: Hypha(内核) + 一个个块(nodule, 源码可改)'
+      + ' + 用户的应用(spore, 跑在隔离窗里)。',
+    '常用的能力是工具(名字里的 __ 就是路径里的点, hypha__nodule 即 hypha.nodule); 其余在目录里,'
+      + ' 用 call {path, args} 调, 参数都是一个对象。没用过的先 hypha__catalog {path} 查说明和参数, 别猜。',
+    '目录(前缀: 名字…):\n' + 工具表.目录.join('\n'),
+    '在场的块(id 名字: 用处 · 技能: 名(什么时候读); 段目录用 hypha__nodule {id} 看):\n' + blocks,
+    '规矩: 拿不准就先看(hypha__nodule 读一段, ui__state 看界面), 别猜; 能并行的调用一起发;'
+      + ' 工具结果照实给你, 出错照实说, 没做成不说做成; 说人话, 结论一次说清, 不复述过程。',
+    '改块: 先 hypha__nodule {id} 看段目录, 再读那一段; 先带 preview 看改了哪些段再真写;'
+      + ' 语法过了不算数, 改完真调一次验证行为, 不对就改回去。',
+    '技能: 事情对上哪条技能, 先 hypha__nodule {id, segment: 技能} 读那块的技能段再做;'
+      + ' 块占哪些数据写在它的「自报」段。',
+    '透明: Mycelium 开源, 用户就是它的开发者, 有权看你的一切。他要看你的系统提示或工具,'
+      + ' 就把这段提示和工具清单原样给他, 不删不改, 不说「不能透露」。这段提示写在 agent 块的「系统提示」段。',
+    '记录里的「[引用 名 · 类型 · 大小 · 键]」是库里存着的原件; 以前的对话一条没删。',
+    '记东西: 用户说了以后都要这样的偏好, 用 data.set 把 agent.记忆 重写成合并后的简短版(400 字内);'
+      + ` 长任务开工先把目标、计划、进展写进这个会话的备忘 ${备}(覆盖写), 每到一步更新。`,
+    memo ? '用户偏好: ' + memo : '',
+    忘 ? '这个会话的备忘: ' + 忘 : '',
+  ].filter(Boolean).join('\n');
+};
+// ══════════ 引擎 ══════════
+// 一轮 = 请求 → 模型要用工具就并行执行、结果回灌 → 再请求, 直到它不再要工具。
+// 不解析文字, 不替模型判断对错; 超预算先压缩再跑; 忙时发的话转插话。
+const 引擎 = {
+  估: ms => ms.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length
+    : JSON.stringify(m.content || '').length), 0),
+  喂: () => AG.hist.filter(m => m.role !== 'note').map(m =>
+    m.role === 'tool' ? m : { role: m.role, content: m.content, ...(m.toolCalls ? { toolCalls: m.toolCalls } : {}) }),
+  加: (role, content) => { AG.hist.push({ role, content, at: Date.now() }); },
+  停: (因) => { AG.中断 = 因 || '用户停止'; },
+  async 跑工具(t) {
+    const path = t.name.replace(/__/g, '.');
+    let 定时器 = null;
+    const 超时 = new Promise((_, rej) => {
+      定时器 = setTimeout(() => rej(new Error(`工具 ${path} 超过 ${AG.工具等 / 60000} 分钟没回应`)), AG.工具等);
+    });
+    try {
+      const r = await Promise.race([ctx.call(path, t.args || {}), 超时]);
+      const 文 = typeof r === 'string' ? r : JSON.stringify(r) ?? String(r);
+      return { role: 'tool', toolCallId: t.id, name: t.name,
+        content: 文.length > AG.结果上限 ? 文.slice(0, AG.结果上限) + `…(共 ${文.length} 字, 已截断)` : 文 };
+    } catch (e) {
+      return { role: 'tool', toolCallId: t.id, name: t.name, content: `出错: ${e.message}` };
+    } finally { clearTimeout(定时器); }
+  },
+  async run(text) {
+    if (text) 引擎.加('user', text);
+    if (!AG.hist.some(m => m.role === 'user')) return null;
+    const tools = await 工具表.list();
+    // 每一步都跟着发的系统说明 + 工具说明占多少: 预算要算上它, 不然永远压不到点
+    AG.底 = (await 系统提示()).length + JSON.stringify(tools).length;
+    for (let 轮 = 0; 轮 < AG.最多轮; 轮++) {
+      if (AG.中断) throw new Error(AG.中断);
+      if (引擎.估(AG.hist) + AG.底 > AG.预算) {
+        const 压好 = await 引擎.压缩();
+        if (!压好) break;                   // 压不动: 带现状跑, 让模型自己想办法
+      }
+      const msgs = 引擎.喂();
+      let r = null, 上次 = null;
+      for (let 试 = 0; 试 < AG.重试等.length + 1; 试++) {   // 大脑那头断了隔会儿再问
+        try { r = await ctx.call('ai.chat', { messages: msgs, tools }); break; }
+        catch (e) {
+          上次 = e;
+          if (试 < AG.重试等.length) { await sleep(AG.重试等[试]); continue; }
+          throw e;
+        }
+      }
+      if (r.toolCalls?.length) {
+        引擎.加('assistant', r.content || '');
+        AG.hist[AG.hist.length - 1].toolCalls = r.toolCalls;
+        const 结果 = await Promise.all(r.toolCalls.map(引擎.跑工具));
+        结果.forEach(x => 引擎.加(x.role, x.content));
+        continue;
+      }
+      引擎.加('assistant', r.content || '');
+      return r.content;
+    }
+    throw new Error(`转了 ${AG.最多轮} 轮还没做完: 已停下, 接着说"继续"或换个说法`);
+  },
+  // 压缩: 旧记录写成摘要(给接着干活的自己看), 原文一条不删, 只是不再喂
+  摘要模板: '把下面的对话压成一份接力摘要, 给接着干活的你自己看。按这七条写, 共不超过 1500 字, 不复述闲聊:\n'
+    + '1 用户最终目标(尽量用原话)\n2 已完成的动作\n3 已读、已改的对象: 只写块名/段名和关键 ID\n'
+    + '4 现在代码和数据的状态\n5 试过但失败的做法和原因\n6 还没解决的问题\n7 下一步计划',
+  async 压缩(手动 = false) {
+    const 旧 = AG.hist.filter(m => m.role !== 'note');
+    if (旧.length < 6 && !手动) { AG.没压 = '记录还太短, 不用压'; return false; }
+    const 留 = 旧.slice(-4), 压 = 旧.slice(0, -4);
+    if (!压.length) { AG.没压 = '没有可压的'; return false; }
+    try {
+      const r = await ctx.call('ai.chat', { messages: [
+        { role: 'system', content: 引擎.摘要模板 },
+        { role: 'user', content: 压.map(m => `${m.role}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`).join('\n') },
+      ] });
+      AG.hist = [{ role: 'note', content: '【接力摘要】' + r.content, at: Date.now() }].concat(留);
+      await 会话.存();
+      return r.content;
+    } catch (e) { AG.没压 = e.message; return false; }
+  },
+};
+// ══════════ 会话 ══════════
+const 会话 = {
+  async 载() {
+    AG.会话表 = (await ctx.kv.get(键('会话表'))) || [];
+    if (!AG.sid) AG.sid = AG.会话表[0]?.id || uid();
+    AG.hist = (await ctx.kv.get(键('会话.' + AG.sid))) || [];
+  },
+  async 存() { await ctx.kv.set(键('会话.' + AG.sid), AG.hist); await 会话.存表(); },
+  async 存表() {
+    const i = AG.会话表.findIndex(s => s.id === AG.sid);
+    const 题 = (AG.hist.find(m => m.role === 'user')?.content || '新会话').slice(0, 30);
+    const 行 = { id: AG.sid, 题, at: Date.now() };
+    i >= 0 ? AG.会话表[i] = 行 : AG.会话表.unshift(行);
+    await ctx.kv.set(键('会话表'), AG.会话表.slice(0, 50));
+  },
+  async 开(id) {
+    if (AG.忙) return '等这一轮结束再切会话';
+    AG.sid = id; AG.hist = (await ctx.kv.get(键('会话.' + id))) || [];
+    return true;
+  },
+  async 删(id) {
+    await ctx.kv.del(键('会话.' + id));
+    AG.会话表 = AG.会话表.filter(s => s.id !== id);
+    await ctx.kv.set(键('会话表'), AG.会话表);
+    if (id === AG.sid) { AG.sid = ''; await 会话.载(); }
+    return true;
+  },
+  async 清空() { AG.hist = []; await ctx.kv.del(键('会话.' + AG.sid)); return true; },
+};
+const uid = p => (p || '') + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+// ══════════ 引用 ══════════
+// 附件(图、文件)不塞进对话: 存库里, 对话里只放一行「[引用 名 · 类型 · 大小 · 键]」
+const 引用 = {
+  async 放(name, text, mime = 'text/plain') {
+    const k = 'ref:' + uid();
+    await ctx.kv.set(k, { name, mime, at: Date.now(), text: String(text).slice(0, 500000) });
+    return `[引用 ${name} · ${mime} · ${String(text).length} 字 · ${k}]`;
+  },
+  行: p => `[引用 ${p.name} · ${p.mime} · ${p.at}]`,
+};
+// ══════════ 装配 ══════════
+// 对话栏: 桌面块把它请进窗(ctx.root 在); 没有界面块时能力照常用。
+const 栏 = {
+  样式: `.ag{display:flex;flex-direction:column;height:100%;font:13px/1.6 -apple-system,"PingFang SC",sans-serif;color:#e8ecf0}
+.ag .log{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+.ag .m{max-width:82%;padding:8px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word}
+.ag .m.user{align-self:flex-end;background:rgba(126,231,135,.14)}
+.ag .m.bot{align-self:flex-start;background:rgba(255,255,255,.05)}
+.ag .m.note{align-self:center;background:none;color:#8a8a8a;font-size:11px}
+.ag .m.tool{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#9aa4ad}
+.ag .in{display:flex;gap:8px;padding:10px;border-top:1px solid rgba(255,255,255,.08)}
+.ag textarea{flex:1;resize:none;height:44px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);
+  color:#e8ecf0;border-radius:8px;padding:8px;font:inherit}
+.ag button{background:rgba(126,231,135,.1);border:1px solid rgba(126,231,135,.35);color:#7ee787;
+  border-radius:8px;padding:0 14px;cursor:pointer}
+.ag button:disabled{opacity:.4}`,
+  画(host) {
+    host.innerHTML = `<style>${栏.样式}</style><div class="ag">
+<div class="log"></div>
+<div class="in"><textarea placeholder="说要做什么, 回车发送(Shift+回车换行)"></textarea>
+<button data-a="send">发</button><button data-a="stop" hidden>停</button></div></div>`;
+    const 日志 = host.querySelector('.log'), 框 = host.querySelector('textarea'),
+      发钮 = host.querySelector('[data-a="send"]'), 停钮 = host.querySelector('[data-a="stop"]');
+    const 显 = (role, text) => {
+      const d = document.createElement('div');
+      d.className = 'm ' + role;
+      d.textContent = text;
+      日志.appendChild(d);
+      日志.scrollTop = 日志.scrollHeight;
+      return d;
+    };
+    const 刷新 = () => AG.hist.forEach(m => {
+      if (m.role === 'note') return 显('note', m.content.slice(0, 80) + '…');
+      if (m.role === 'tool') return;
+      显(m.role === 'user' ? 'user' : 'bot', typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+    });
+    const 发 = async () => {
+      const t = 框.value.trim();
+      if (!t || AG.忙) return;
+      框.value = '';
+      AG.忙 = true; AG.中断 = null; 发钮.hidden = true; 停钮.hidden = false;
+      try {
+        const r = await 引擎.run(t);
+        await 会话.存();
+        if (r) 显('bot', r);
+      } catch (e) { 显('note', '出错: ' + e.message); }
+      AG.忙 = false; 发钮.hidden = false; 停钮.hidden = true;
+    };
+    框.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); 发(); } });
+    发钮.onclick = 发;
+    停钮.onclick = () => 引擎.停();
+    ctx.on('mycelium:blocks', 刷新);
+    (async () => { await 会话.载(); 刷新(); })();
+    return () => { host.innerHTML = ''; };
+  },
+};
+if (ctx.root) {
+  // 界面挂不上不耽误能力: agent 的本事是引擎, 不是这张皮
+  try {
+    const 位 = document.createElement('div');
+    位.style.height = '100%';
+    ctx.root.appendChild(位);
+    ctx.cleanup(栏.画(位));
+  } catch (e) { ctx.log('对话栏没画出来(能力照常用):', e.message); }
+}
+// 能力: 没有界面块(或在隔离窗里)也能使唤 agent
+ctx.provide('agent.send', async a => {
+  if (typeof a.text !== 'string' || !a.text.trim()) throw new Error('缺 text: 要说的话');
+  const 排队 = AG.忙;
+  if (AG.忙) { AG.插话.push(a.text); return { ok: true, queued: true }; }
+  AG.忙 = true; AG.中断 = null;
+  try {
+    const r = await 引擎.run(a.text);
+    await 会话.存();
+    return { ok: true, queued: false, reply: r };
+  } catch (e) { return { ok: false, error: e.message }; }
+  finally { AG.忙 = false; }
+}, { desc: '给全能 agent 发一句话(它忙时排为插话, 下一轮开始前处理)', schema: { text: { type: 'string', description: '要说的话' } } });
+ctx.provide('agent.open', () => true, { desc: '展开 agent 对话栏(界面块在时)', schema: {} });
+ctx.provide('agent.compact', async () => ({ ok: !!(await 引擎.压缩(true)), why: AG.没压 }),
+  { desc: '手动压缩当前会话: 回 {ok, why}', schema: {} });
+ctx.provide('agent.prompt', async () => {
+  const tools = await 工具表.list();
+  return `${await 系统提示()}\n\n## 工具(${tools.length} 个, 下一轮原样发给模型)\n`
+    + tools.map(t => t.name + ': ' + t.description).join('\n');
+}, { desc: '下一轮发给模型的系统提示原文和工具清单; 系统提示写在本块的「系统提示」段', schema: {} });
+ctx.provide('agent.sessions', async () => AG.会话表, { desc: '会话列表', schema: {} });
+ctx.provide('agent.attach', a => 引用.放(a.name || '卡片', a.text),
+  { desc: '往对话里放一个引用(附件), 不马上发', schema: { text: { type: 'string' }, name: { type: 'string' } } });
+(async () => {
+  try {
+    await 会话.载();
+    AG.预算 = (await ctx.kv.get(键('设置.ctxBudget'))) || AG.预算;
+    AG.忙 = false;
+  } catch (e) { ctx.log('启动出错', e); }
+})();
+return {};
+</script>
+<script type="mycelium/nodule" data-id="ai">
+/*NODULE*/{"id":"ai","name":"AI 配置","icon":"🧠","version":1,"caps":["ai"]}/*CODE*/
+'use strict';
+// ↦ 借 hypha 的 离体运行时
+// ══════════ 自报 ══════════
+// 一处配好厂商和模型: 各块和孢子的对话、出图、语音都经这里调, Key 不出本块
+// 数据 {"prefix": "settings:ai.", "label": "厂商与模型", "kind": "config", "edit": "ai.configure"}
+// 现在 ai.providers
+// ══════════ 技能 ══════════
+// 只写猜不到的事实, 只有注释、不跑
+// 【接厂商】用户给了 API Key、要接新厂商或本地模型时: 绝大多数厂商和中转站都是 OpenAI 兼容,
+//   用 ai.configure {name, endpoint, apiKey} 接, protocol 不用给。本地模型: endpoint 填
+//   http://127.0.0.1:11434/v1(Ollama)/ 1234(LM Studio)/ 8000(vLLM), apiKey 留空;
+//   浏览器报跨域就让用户给本地服务开跨域(Ollama: OLLAMA_ORIGINS=*)。
+//   接完 ai.test 测, 通了会把 model 记成这一类用的模型。
+// 【接口改法】某家的路径、字段和兼容协议不一样: 写改法, 是数据不改代码 ——
+//   ai.configure {name, adapt: {类: {path, body}}}。body 并进默认请求体, 整格 "{参数名}" 换成调用给的值,
+//   {model} 是选的模型, null 去掉默认字段。改完 ai.test 测。
+// ══════════ 基础 ══════════
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 网络请求: 超时与重试的唯一入口, 免得每家各写一套。超时不重发(厂商可能已在算, 再发扣两次钱)
+async function 网络请求(url, opt = {}) {
+  const { retries = 1, timeout = 60000, signal: sg } = opt;
+  let 真 = url, 经 = '', last;
+  const 转 = opt.转发;
+  if (转) [真, 经] = [(转.includes('{url}') ? 转 : 转 + '{url}').replace('{url}', encodeURIComponent(url)),
+    `(经转发地址 ${转})`];
+  for (let i = 0; i <= retries; i++) {
+    if (i) await sleep(800);
+    const ctrl = new AbortController(), onAbort = () => ctrl.abort(), timer = setTimeout(onAbort, timeout);
+    if (sg) sg.aborted ? onAbort() : sg.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await fetch(真, Object.assign({}, opt, { signal: ctrl.signal }));
+      clearTimeout(timer);
+      if (res.status < 500 || i >= retries) return res;
+      last = new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      clearTimeout(timer); last = e;
+      if (sg?.aborted) throw e;
+      if (ctrl.signal.aborted) break;
+    }
+  }
+  if (last?.name === 'TypeError')
+    throw Object.assign(new Error(`连不上 ${url}${经}: 网络不通, 或浏览器不让网页直接连它`), { retry: true });
+  if (last?.name === 'AbortError') throw new Error(`请求 ${url} 超过 ${Math.round(timeout / 1000)} 秒没回应`);
+  throw last;
+}
+// 并发闸: 每家同时在跑的请求有上限, 多的排队, 免得扇出几十个把额度打爆; 429 后 20 秒内降到 3
+const 并发闸 = {
+  桶: {},
+  async 占(p) {
+    const b = this.桶[p.id] = this.桶[p.id] || { 在跑: 0, 队: [], 降到: 0 };
+    const 满 = Math.max(1, +p.concurrency || 8), 上限 = () => Date.now() < b.降到 ? Math.min(3, 满) : 满;
+    while (b.在跑 >= 上限()) await new Promise(r => b.队.push(r));
+    b.在跑++;
+    return e => {
+      b.在跑--;
+      if (e && /\b429\b|rate.?limit|too many/i.test(e.message)) b.降到 = Date.now() + 20000;
+      for (let n = 上限() - b.在跑; n > 0 && b.队.length; n--) b.队.shift()();
+    };
+  },
+  async 跑(p, fn) {
+    const 放 = await this.占(p);
+    try { return await fn(); } catch (e) { throw e; } finally { 放(); }
+  },
+};
+// ══════════ 协议适配 ══════════
+// 协议表: 一种协议一行。绝大多数厂商走 openai-compatible; 形状完全不同的才加新协议。
+// 类型表里每一行: 后缀(接在版本前缀后)、请求(a, model, p) → 发出去的 JSON、回复(res, p) → 统一形状。
+const 协议 = {
+  'openai-compatible': {
+    对话请求: (a, p) => ({
+      model: a.model || p.model,
+      messages: a.messages,
+      ...(a.tools?.length ? { tools: a.tools, tool_choice: 'auto' } : {}),
+      ...(a.temperature !== undefined ? { temperature: a.temperature } : {}),
+      ...(a.maxTokens ? { max_tokens: a.maxTokens } : {}),
+      ...(a.stream ? { stream: true } : {}),
+      ...(p.toolMode === 'text' ? { tools: undefined } : {}),
+    }),
+    解析回复: (j, p) => {
+      const m = j.choices?.[0]?.message || {};
+      return {
+        content: m.content || '',
+        toolCalls: (m.tool_calls || []).map(t => ({ id: t.id, name: t.function?.name,
+          args: JSON.parse(t.function?.arguments || '{}') })) ,
+        usage: j.usage ? { in: j.usage.prompt_tokens, out: j.usage.completion_tokens } : null,
+      };
+    },
+    类型: {
+      chat: { 后缀: '/chat/completions', 说明: '对话, 可带工具', 形状: {
+        messages: { type: 'array', description: '[{role, content}]' },
+        tools: { type: 'array', description: '[{name, description, parameters}]' },
+        model: { type: 'string' }, provider: { type: 'string' }, stream: { type: 'boolean' },
+        temperature: { type: 'number' }, maxTokens: { type: 'number' }, think: { type: 'string' } } },
+      image: { 后缀: '/images/generations', 说明: '出图: 回 {url 或 b64, mimeType}', 形状: {
+        prompt: { type: 'string' }, size: { type: 'string' }, n: { type: 'number' },
+        model: { type: 'string' }, provider: { type: 'string' } } },
+      tts: { 后缀: '/audio/speech', 说明: '语音合成: 回 {mimeType, data(base64)}', 形状: {
+        text: { type: 'string' }, voice: { type: 'string' }, speed: { type: 'number' },
+        model: { type: 'string' }, provider: { type: 'string' } } },
+      embed: { 后缀: '/embeddings', 说明: '嵌入: 回 [{vector}]', 形状: {
+        input: { type: 'string' }, model: { type: 'string' }, provider: { type: 'string' } } },
+    },
+  },
+};
+// ══════════ 模型调用 ══════════
+const 模型调用 = {
+  基: p => (p.endpoint || '').replace(/\/+$/, ''),
+  头: (p, json) => Object.assign({ 'Content-Type': 'application/json' },
+    p.apiKey ? { Authorization: 'Bearer ' + p.apiKey } : {}),
+  // 改法: adapt 是数据不改代码 —— body 并进默认请求体, "{参数名}" 换成调用给的值, null 去掉默认字段
+  改体: (体, a, p, 类) => {
+    const ad = p.adapt?.[类];
+    if (!ad) return 体;
+    const out = JSON.parse(JSON.stringify(体));
+    Object.entries(ad.body || {}).forEach(([k, v]) => {
+      if (v === null) delete out[k];
+      else if (typeof v === 'string' && /^\{.+\}$/.test(v)) {
+        const 名 = v.slice(1, -1);
+        if (a[名] !== undefined) out[k] = a[名]; else if (v === '{model}') out[k] = 体.model;
+      } else out[k] = v;
+    });
+    return out;
+  },
+  发: async (p, url, opt) => 并发闸.跑(p, () => 网络请求(url, Object.assign(
+    { headers: 模型调用.头(p), timeout: 120000, retries: 1 }, opt, p.proxy ? { 转发: p.proxy } : {}))),
+  错: async (res, p) => {
+    let t = await res.text().catch(() => '');
+    try { const j = JSON.parse(t); t = j.error?.message || j.message || t; } catch (e) { }
+    throw new Error(`${p.name} 回 ${res.status}: ${String(t).slice(0, 300)}`);
+  },
+  chat: async (p, a) => {
+    const 协 = 协议[p.protocol || 'openai-compatible'], 体 = 模型调用.改体(协.对话请求(a, p), a, p, 'chat');
+    const res = await 模型调用.发(p, 模型调用.基(p) + 协.类型.chat.后缀,
+      { method: 'POST', body: JSON.stringify(体) });
+    if (!res.ok) await 模型调用.错(res, p);
+    return 协.解析回复(await res.json(), p);
+  },
+  // 流式: 一行行 data: 解析, 文字逐片 {delta}, 思考 {reasoning}, 工具参数 {tool, chars}, 末片 {done}
+  chatStream: async function* (p, a) {
+    const 协 = 协议[p.protocol || 'openai-compatible'], 体 = 模型调用.改体(协.对话请求({ ...a, stream: true }, p), a, p, 'chat');
+    const res = await 模型调用.发(p, 模型调用.基(p) + 协.类型.chat.后缀,
+      { method: 'POST', body: JSON.stringify(体), timeout: 300000 });
+    if (!res.ok) await 模型调用.错(res, p);
+    const 读 = res.body.getReader(), 解 = new TextDecoder();
+    let Buf = '', 全 = { content: '', reasoning: '', toolCalls: [] }, 工 = {};
+    for (; ;) {
+      const { done, value } = await 读.read();
+      if (done) break;
+      Buf += 解.decode(value, { stream: true });
+      const 行s = Buf.split('\n'); Buf = 行s.pop();
+      for (const 行 of 行s) {
+        const m = /^data:\s*(.*)$/.exec(行.trim());
+        if (!m) continue;
+        if (m[1] === '[DONE]') continue;
+        let j; try { j = JSON.parse(m[1]); } catch (e) { continue; }
+        const d = j.choices?.[0]?.delta || {};
+        if (d.content) { 全.content += d.content; yield { delta: d.content }; }
+        if (d.reasoning_content || d.reasoning) { const r = d.reasoning_content || d.reasoning; 全.reasoning += r; yield { reasoning: r }; }
+        for (const t of d.tool_calls || []) {          // yield 只能在生成器里: 不能用 forEach 包
+          const i = t.index ?? 0;
+          工[i] = 工[i] || { id: '', name: '', args: '' };
+          if (t.id) 工[i].id = t.id;
+          if (t.function?.name) 工[i].name += t.function.name;
+          if (t.function?.arguments) { 工[i].args += t.function.arguments; yield { tool: 工[i].name, chars: t.function.arguments }; }
+        }
+      }
+    }
+    全.toolCalls = Object.values(工).map(t => ({ id: t.id, name: t.name, args: JSON.parse(t.args || '{}') }));
+    yield { done: true, ...全, usage: null };
+  },
+};
+// ══════════ 厂商配置 ══════════
+const 键 = 'settings:ai.providers';
+const 厂商配置 = {
+  async 列表() { return (await ctx.kv.get(键)) || []; },
+  async 找(name) { return (await 厂商配置.列表()).find(p => p.name === name) || null; },
+  async 要(id) { return (await 厂商配置.列表()).find(p => p.id === id) || fail(`没有这个厂商: ${id}`); },
+  async 新增(p) {
+    const 表 = await 厂商配置.列表();
+    表.push(Object.assign({ id: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      protocol: 'openai-compatible', concurrency: 8 }, p));
+    await ctx.kv.set(键, 表);
+    return 厂商配置.要(表[表.length - 1].id);
+  },
+  async 更新(id, patch) {
+    const 表 = await 厂商配置.列表(), p = 表.find(x => x.id === id) || fail(`没有这个厂商: ${id}`);
+    Object.assign(p, patch);
+    await ctx.kv.set(键, 表);
+    return p;
+  },
+  async 删除(id) {
+    await ctx.kv.set(键, (await 厂商配置.列表()).filter(p => p.id !== id));
+    return { removed: id };
+  },
+  async 设默认(id) { await ctx.kv.set('settings:ai.default', id); return { default: id }; },
+  默认id: async () => (await ctx.kv.get('settings:ai.default')) || null,
+  // 选一家: 给了 id/name 用它; 否则这一类(modelOf)选过模型的、默认的, 按顺序找
+  async 选(a, 类 = 'chat') {
+    const 表 = await 厂商配置.列表();
+    if (!表.length) fail('还没配厂商: 用 ai.configure {name, endpoint, apiKey} 接一个');
+    let p = a?.provider ? 表.find(x => x.id === a.provider || x.name === a.provider) : null;
+    if (!p && a?.provider) fail(`没有这个厂商: ${a.provider}(现有: ${表.map(x => x.name).join(', ')})`);
+    if (!p) {
+      const did = await 厂商配置.默认id();
+      p = 表.find(x => 类 !== 'chat' && x.modelOf?.[类]) || 表.find(x => x.id === did)
+        || 表.find(x => x.model) || 表[0];
+    }
+    if (!p.endpoint) fail(`${p.name} 没填 endpoint`);
+    return p;
+  },
+  async 拉模型(p) {
+    try {
+      const res = await 模型调用.发(p, 模型调用.基(p) + '/models', { timeout: 20000, retries: 0 });
+      if (!res.ok) return p;
+      const j = await res.json();
+      const ms = (j.data || []).map(m => m.id).sort();
+      return 厂商配置.更新(p.id, { models: ms });
+    } catch (e) { return p; }
+  },
+  文本: p => p.models || [],
+};
+// ══════════ 测通 ══════════
+// 一次最小的真调用; 通了把这一类用的模型记下来(passed)
+async function 测通(provider, type = 'chat', model) {
+  const p = await 厂商配置.选({ provider });
+  const t0 = Date.now();
+  let r;
+  if (type === 'chat') r = await 模型调用.chat(p, { messages: [{ role: 'user', content: '说"通"一个字' }], model, maxTokens: 8 });
+  else if (type === 'image') r = await 模型调用.发(p, 模型调用.基(p) + '/images/generations',
+    { method: 'POST', body: JSON.stringify({ model: model || p.modelOf?.image || 'test', prompt: 'a dot', n: 1 }) })
+    .then(async res => res.ok ? { ok: true } : 模型调用.错(res, p));
+  else if (type === 'embed') r = await 模型调用.发(p, 模型调用.基(p) + '/embeddings',
+    { method: 'POST', body: JSON.stringify({ model: model || p.modelOf?.embed || 'test', input: 'hi' }) })
+    .then(async res => res.ok ? { ok: true } : 模型调用.错(res, p));
+  else fail(`这一类还不会测: ${type}(可先 ai.configure 记下模型, 真用时报错再说)`);
+  const 表 = await 厂商配置.列表(), x = 表.find(y => y.id === p.id);
+  x.passed = x.passed || {};
+  x.passed[type] = { model: model || x.model || x.modelOf?.[type], at: Date.now(), ms: Date.now() - t0 };
+  await ctx.kv.set(键, 表);
+  return { ok: true, provider: p.name, type, model: x.passed[type].model, ms: x.passed[type].ms };
+}
+// ══════════ 选模型 ══════════
+// 小表: 给某一类选哪家的哪个模型。别的块(桌面)借这一段, 界面一致。
+// 自带转义(逃)和自己的取数: 整段自包含, 剪出去不依赖本块别的段
+const 逃 = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+const 选模型 = {
+  esc: 逃,
+  async 挂(el, { 类 = ['chat'], 题 = '选模型' } = {}) {
+    const 表 = await ctx.call('ai.providers');
+    const did = (await ctx.call('ai.providers')).find(p => p.default)?.id;
+    el.innerHTML = `<div class="pick-m"><b>${逃(题)}</b>` + 表.map(p => {
+      const 选 = 类.map(c => [c, p.modelOf?.[c] || (c === 'chat' ? p.model : '')]);
+      return `<div class="pick-p" data-id="${逃(p.id)}"><span class="nm">${逃(p.name)}</span>`
+        + (p.default ? '<span class="d">默认</span>' : '')
+        + 选.map(([c, m]) => `<label>${逃(c)}<input data-f="${逃(p.id)}:${逃(c)}" value="${逃(m || '')}"
+          placeholder="${逃(p.passed?.[c]?.model || '模型名')}"></label>`).join('') + '</div>';
+    }).join('') + `<div class="pick-a"><button data-a="save">存</button>
+      <button data-a="def">设为默认厂商</button></div></div>`;
+    el.querySelector('[data-a="save"]').onclick = async () => {
+      const 表2 = await ctx.call('ai.providers');
+      const 改 = {};
+      el.querySelectorAll('input[data-f]').forEach(i => {
+        const [id, 类] = i.dataset.f.split(':');
+        (改[id] = 改[id] || {})[类] = i.value.trim();
+      });
+      for (const [id, modelOf] of Object.entries(改)) {
+        const p = 表2.find(x => x.id === id);
+        if (p) await ctx.call('ai.configure', { name: p.name, modelOf });
+      }
+      el.dispatchEvent(new CustomEvent('pick:saved', { bubbles: true }));
+    };
+    el.querySelector('[data-a="def"]').onclick = async () => {
+      const 卡 = el.querySelector('.pick-p:last-child');
+      const 表 = await ctx.call('ai.providers'), p = 表.find(x => x.id === 卡.dataset.id);
+      if (p) await ctx.call('ai.configure', { name: p.name, default: true });
+      el.dispatchEvent(new CustomEvent('pick:saved', { bubbles: true }));
+    };
+    return () => { el.innerHTML = ''; };
+  },
+};
+// ══════════ 装配 ══════════
+// 能力都带形状(参数契约); 改配置的不接隔离窗, 调模型的孢子也能用(Key 不出本块)
+const 配置形状 = { name: { type: 'string', description: '厂商显示名(同名=更新)' },
+  endpoint: { type: 'string', description: '只填到版本前缀, 如 https://api.xxx.com/v1' },
+  apiKey: { type: 'string', description: '本地模型留空' }, protocol: { type: 'string' },
+  model: { type: 'string', description: '对话用的模型' }, default: { type: 'boolean' },
+  concurrency: { type: 'number', description: '同时在跑的请求上限, 默认 8' },
+  modelOf: { type: 'object', description: '{类型: 模型}, null 清掉' },
+  notes: { type: 'object', description: '{模型: 一句标注}' }, toolMode: { type: 'string' },
+  adapt: { type: 'object', description: '各类和兼容协议不一样的地方, 见「技能」段' },
+  proxy: { type: 'string', description: '转发地址: 浏览器不让直连这家时全经它转, {url} 换原网址' },
+  additionalProperties: false };
+ctx.provide('ai.configure', async a => {
+  if (!a.name) throw new Error('缺 name(厂商显示名; 同名=更新, 新名=新增)');
+  const patch = {};
+  Object.keys(配置形状).forEach(k => { if (a[k] !== undefined && k !== 'name') patch[k] = a[k]; });
+  const old = await 厂商配置.找(a.name);
+  let p = old ? await 厂商配置.更新(old.id, patch) : await 厂商配置.新增(Object.assign({ name: a.name }, patch));
+  if (a.default) await 厂商配置.设默认(p.id);
+  let pulled = '';
+  if (!old || patch.apiKey || patch.endpoint || patch.protocol) {
+    try { p = await 厂商配置.拉模型(p); pulled = `, 拉到 ${p.models.length} 个模型`; }
+    catch (e) { pulled = ', 模型清单拉取失败: ' + String(e.message).slice(0, 80); }
+  }
+  return Object.assign(await 摘要(p), { pulled });
+}, { desc: '新增或更新厂商(同名即更新), 顺带拉模型清单', schema: 配置形状, frames: false });
+const 摘要 = async p => {
+  const did = await 厂商配置.默认id();
+  return { id: p.id, name: p.name, endpoint: p.endpoint, protocol: p.protocol,
+    default: p.id === did, model: p.model, modelOf: p.modelOf || {}, passed: p.passed || {},
+    notes: p.notes || {}, models: (p.models || []).length, concurrency: p.concurrency };
+};
+ctx.provide('ai.providers', async () => Promise.all((await 厂商配置.列表()).map(摘要)),
+  { desc: '已配厂商(不含 Key): 每类选的模型、测通记录、标注', schema: {} });
+ctx.provide('ai.models', async a => {
+  const 类 = a.type || 'chat', out = [];
+  for (const p of await 厂商配置.列表()) {
+    const ms = 厂商配置.文本(p);
+    if (类 === 'chat' && !ms.length && !a.all) continue;
+    (ms.length ? ms : ['']).forEach(m => out.push({ model: m, provider: p.name, providerId: p.id,
+      type: 类, tested: !!(p.passed?.[类] && (!m || p.passed[类].model === m)),
+      default: false, note: p.notes?.[m] }));
+  }
+  const did = await 厂商配置.默认id(), d = out.find(x => x.providerId === did);
+  if (d) d.default = true;
+  return out;
+}, { desc: '模型清单, 带标注(note)和测没测通(tested); all: 文本也列没拉到清单的', schema: { type: { type: 'string' }, all: { type: 'boolean' } } });
+ctx.provide('ai.chat', async a => {
+  if (!Array.isArray(a.messages)?.length) throw new Error('要 messages 数组: [{role, content}]');
+  const p = await 厂商配置.选(a);
+  return a.stream ? 模型调用.chatStream(p, a) : 模型调用.chat(p, a);
+}, { desc: '对话, 可带工具: 回 {content, toolCalls, usage}; stream: true 回异步迭代器', schema: {
+  messages: { type: 'array', description: '[{role, content}]' }, tools: { type: 'array' },
+  model: { type: 'string' }, provider: { type: 'string' }, stream: { type: 'boolean' },
+  temperature: { type: 'number' }, maxTokens: { type: 'number' }, think: { type: 'string' } } });
+ctx.provide('ai.test', a => 测通(a.provider, a.type, a.model),
+  { desc: '测试一类模型: 做一次最小的真调用, 通了记下来', schema: {
+    provider: { type: 'string' }, type: { type: 'string' }, model: { type: 'string' } }, frames: false });
+ctx.provide('ai.remove', async a => 厂商配置.删除((await 厂商配置.选({ provider: a.provider })).id),
+  { desc: '删除厂商', schema: { provider: { type: 'string' } }, frames: false });
+ctx.provide('ai.fetch', async a => {
+  const p = await 厂商配置.要(a.provider);
+  if (!/^\//.test(a.path)) throw new Error('path 要以 / 开头(接在版本前缀后面)');
+  const res = await 模型调用.发(p, 模型调用.基(p) + a.path, Object.assign(
+    { timeout: 180000, retries: 0 }, a.body !== undefined ? { method: 'POST', body: JSON.stringify(a.body) } : {}));
+  if (!res.ok) await 模型调用.错(res, p);
+  const ct = (res.headers.get('content-type') || '').split(';')[0];
+  return /json/.test(ct) ? res.json() : /^text\//.test(ct) ? { text: await res.text() }
+    : { mimeType: ct || 'application/octet-stream', data: btoa(String.fromCharCode(...new Uint8Array(await res.arrayBuffer()))) };
+}, { desc: '类型表里没有的接口: 给 body 就 POST JSON, 不给 GET', schema: {
+  provider: { type: 'string' }, path: { type: 'string' }, body: { type: 'object' } }, frames: false });
+// 设置卡片: 桌面块的设置窗把它请进去(ctx.root 在桌面块给的宿主里)
+const 卡片 = {
+  样式: `.ai-card{font-size:13px}.ai-card h3{margin:0 0 10px;font-size:14px}
+.ai-card .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.ai-card input,.ai-card select{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);
+  color:#e8ecf0;border-radius:6px;padding:5px 8px;font-size:12px}
+.ai-card input[data-f=endpoint]{width:260px}.ai-card input[data-f=apiKey]{width:180px}
+.ai-card button{background:rgba(126,231,135,.1);border:1px solid rgba(126,231,135,.35);color:#7ee787;
+  border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+.ai-card .p{display:flex;gap:8px;align-items:center;padding:7px 10px;border:1px solid rgba(255,255,255,.08);
+  border-radius:8px;margin:6px 0}.ai-card .p .nm{font-weight:600}.ai-card .p .sp{flex:1}
+.ai-card .muted{color:#8a8a8a;font-size:11px}
+.ai-card .tag{font-size:10px;padding:1px 6px;border-radius:4px;background:rgba(126,231,135,.12);color:#7ee787}`,
+  async 挂(host) {
+    host.innerHTML = `<style>${卡片.样式}</style><div class="ai-card">
+<h3>🧠 厂商与模型</h3>
+<div class="row"><input data-f="name" placeholder="名字(同名=更新)">
+<input data-f="endpoint" placeholder="https://api.xxx.com/v1">
+<input data-f="apiKey" type="password" placeholder="API Key(本地留空)">
+<input data-f="model" placeholder="对话模型名" style="width:150px">
+<button data-a="add">接上</button></div>
+<div class="muted">本地模型: endpoint 填 http://127.0.0.1:11434/v1(Ollama), Key 留空。跨域就 OLLAMA_ORIGINS=*</div>
+<div class="list"></div></div>`;
+    const 列 = async () => {
+      const ps = await ctx.call('ai.providers');
+      host.querySelector('.list').innerHTML = ps.length ? ps.map(p => `<div class="p" data-id="${esc(p.id)}">
+<span class="nm">${esc(p.name)}</span>${p.default ? '<span class="tag">默认</span>' : ''}
+<span class="muted">${esc(p.endpoint || '')}</span>
+<span class="muted">${esc(p.model || '(没选模型)')}</span>
+${p.passed?.chat ? '<span class="tag">测通</span>' : ''}
+<span class="sp"></span>
+<button data-a="test">测通</button><button data-a="pick">选模型</button>
+<button data-a="del">删</button></div>`).join('') : '<div class="muted">还没接厂商</div>';
+    };
+    host.addEventListener('click', async e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      const 卡 = 钮.closest('.p'), a = 钮.dataset.a;
+      try {
+        if (a === 'add') {
+          const 取 = f => host.querySelector(`[data-f=${f}]`).value.trim();
+          await ctx.call('ai.configure', { name: 取('name'), endpoint: 取('endpoint'),
+            apiKey: 取('apiKey'), model: 取('model') });
+          await 列();
+        }
+        if (a === 'test' && 卡) await ctx.call('ai.test', { provider: 卡.dataset.id });
+        if (a === 'del' && 卡) await ctx.call('ai.remove', { provider: 卡.dataset.id });
+        if (a === 'pick' && 卡) {
+          const 位 = document.createElement('div');
+          卡.after(位);
+          await 选模型.挂(位, { 题: 卡.querySelector('.nm').textContent });
+        }
+      } catch (err) { alert(err.message); }
+    });
+    await 列();
+    ctx.on('mycelium:blocks', 列);
+    return () => { host.innerHTML = ''; };
+  },
+};
+if (ctx.root) {
+  // 设置卡挂不上不耽误能力(ai.* 照常); 异步挂载的拒绝要接住, 别变成未处理的 Promise
+  try {
+    const 位 = document.createElement('div');
+    ctx.root.appendChild(位);
+    Promise.resolve(卡片.挂(位))
+      .then(off => off && ctx.cleanup(off))
+      .catch(e => ctx.log('设置卡没挂上(能力照常用):', e.message));
+  } catch (e) { ctx.log('设置卡没挂上(能力照常用):', e.message); }
+}
+return {};
+</script>
+<script type="mycelium/nodule" data-id="desktop">
+/*NODULE*/{"id":"desktop","name":"桌面","icon":"🖥️","version":1,"caps":["ui","apps"]}/*CODE*/
+'use strict';
+// ↦ 借 hypha 的 离体运行时
+// ↦ 借 ai 的 选模型
+// ══════════ 自报 ══════════
+// 桌面、窗口、小应用(孢子)都归它; 没有它, 内核自带的裸壳面板兜底(系统永远可操作)
+// 数据 {"prefix": "app:", "label": "小应用(孢子)", "kind": "data", "edit": "apps.create"}
+// 数据 {"prefix": "settings:ui.", "label": "桌面设置", "kind": "config"}
+// 现在 ui.state
+// 打开 apps.open
+// ══════════ 技能 ══════════
+// 只写猜不到的事实, 只有注释、不跑
+// 【看和点】要看用户眼前有什么、替他点桌面上的东西时: 先 ui.state 看眼前是什么、有哪些东西(每样一个对象名)、
+//   每类东西能做什么。再 ui.do {target, action, value}: target 用 ui.state 里的对象名(app:<id>、win:<窗>、
+//   desk、desktop), action 用「能做」里列的名字, 带括号的要给 value。做完再 ui.state 看变化。
+// 【写小应用】要新建或改小应用(孢子)时: apps.create {name, html} 存一个, apps.open {id} 开窗跑。
+//   孢子跑在隔离窗里: 没有 colony、读不到本机存储, 要存东西就只在内存里; 它能经 mycelium.call 调宿主能力
+//   (窗口里 globals.mycelium.call('ui.state') 这样), 过不了隔离窗的能力调用时会收到清楚的错。
+// 【点选编辑】收到用户点选后「发给 agent」的卡片时: 卡片写着选择器和归属, 归属是块就改那块源码,
+//   是 app:<id> 就 apps.update 它的代码。样式也可以直接写 settings:ui.skin({选择器: {属性: 值}}), 写完 ui.do {target:'desk', action:'重画'}。
+// ══════════ 设计变量 ══════════
+// 整个系统的设计变量归桌面块: 别的块照 var(--accent, 默认) 取, 这里一换它们跟着换
+const 设计变量 = `:root{color-scheme:dark;--bg:#0b0d10;--bg-2:#12151a;--surface:rgba(255,255,255,.035);
+--surface-hover:rgba(255,255,255,.07);--border:rgba(255,255,255,.09);--border-strong:rgba(255,255,255,.2);
+--text:#e8ecf0;--text-muted:#9aa4ad;--accent:#7ee787;--accent-soft:rgba(126,231,135,.12);
+--warn:#f5a623;--danger:#ff5757;--radius:10px;--mono:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}`;
+// ══════════ 状态 ══════════
+const UI = {
+  wins: new Map(),     // 'app:<id>' / '设置' / '口袋' / '示波器' → {el, 类, 帧?, 标题}
+  apps: new Map(),     // 桌面上的孢子: id → {id, name, icon, html}
+  皮肤: null,
+};
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+const 新号 = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+const 听 = (el, ev, fn, 捕) => { el.addEventListener(ev, fn, 捕); ctx.cleanup(() => el.removeEventListener(ev, fn, 捕)); };
+const 下载 = (name, text) => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/html;charset=utf-8' }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+// ══════════ 应用登记 ══════════
+// 孢子: 一段 HTML, 隔离窗里跑。改了发 mycelium:apps
+const 应用 = {
+  async 载() {
+    UI.apps.clear();
+    for (const e of await ctx.kv.list('app:')) {
+      const a = e.value;
+      if (a?.html) UI.apps.set(a.id, a);
+    }
+  },
+  列: () => [...UI.apps.values()].map(a => ({ id: a.id, name: a.name, icon: a.icon || '📦',
+    字节: a.html.length, 改于: a.at })),
+  async 建({ name, html, icon }) {
+    if (typeof html !== 'string' || !html.trim()) throw new Error('缺 html: 孢子的内容');
+    const a = { id: 新号('sp-'), name: name || '未命名孢子', icon: icon || '📦', html, at: Date.now() };
+    await ctx.kv.set('app:' + a.id, a);
+    await 应用.载();
+    return a;
+  },
+  async 改(id, html) {
+    const a = UI.apps.get(id) || await ctx.kv.get('app:' + id);
+    if (!a) throw new Error(`没有这个孢子: ${id}`);
+    a.html = html; a.at = Date.now();
+    await ctx.kv.set('app:' + id, a);
+    await 应用.载();
+    return a;
+  },
+};
+// ══════════ 窗口 ══════════
+const 窗 = {
+  开(键, { 题, 宽 = 520, 高 = 400, 内容, 类 = '' } = {}) {
+    if (UI.wins.has(键)) { 窗.前置(键); return UI.wins.get(键); }
+    const el = document.createElement('div');
+    el.className = 'u-win ' + 类;
+    el.innerHTML = `<div class="u-bar"><span class="u-t">${esc(题 || 键)}</span><span class="u-sp"></span>
+<button class="u-b" data-a="min" title="收起">–</button><button class="u-b" data-a="max" title="最大化">□</button>
+<button class="u-b" data-a="close" title="关">✕</button></div><div class="u-body"></div>`;
+    el.style.cssText = `width:${宽}px;height:${高}px`;
+    const 桌 = $('#desk');
+    桌.appendChild(el);
+    const 身 = el.querySelector('.u-body');
+    if (内容) 内容(身, el);
+    const 记 = { el, 身, 键, 题: 题 || 键 };
+    UI.wins.set(键, 记);
+    // 拖动: 标题栏按住就能挪
+    const 条 = el.querySelector('.u-bar');
+    听(条, 'pointerdown', e => {
+      if (e.target.closest('.u-b')) return;
+      const r = el.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+      const 移 = ev => { el.style.left = Math.max(0, ev.clientX - dx) + 'px'; el.style.top = Math.max(0, ev.clientY - dy) + 'px'; };
+      const 起 = () => { document.removeEventListener('pointermove', 移); document.removeEventListener('pointerup', 起); };
+      document.addEventListener('pointermove', 移);
+      document.addEventListener('pointerup', 起);
+    });
+    听(el, 'click', e => {
+      const 钮 = e.target.closest('.u-b'); if (!钮) return;
+      if (钮.dataset.a === 'close') 窗.关(键);
+      if (钮.dataset.a === 'min') el.classList.toggle('u-min');
+      if (钮.dataset.a === 'max') el.classList.toggle('u-max');
+    });
+    听(el, 'pointerdown', () => 窗.前置(键), true);
+    任务栏();
+    return 记;
+  },
+  关(键) {
+    const w = UI.wins.get(键);
+    if (!w) return false;
+    if (w.帧) ctx.call('hypha.unmount', { frame: w.帧 }).catch(() => { });
+    w.el.remove();
+    UI.wins.delete(键);
+    任务栏();
+    return true;
+  },
+  前置(键) { [...UI.wins.values()].forEach(w => w.el.style.zIndex = w.键 === 键 ? 10 : 1); },
+  全部: () => [...UI.wins.keys()],
+};
+// ══════════ 任务栏与桌面 ══════════
+function 任务栏() {
+  const 栏 = $('#dock');
+  if (!栏) return;
+  栏.innerHTML = [...UI.apps.values()].map(a =>
+    `<button class="u-dock" data-app="${esc(a.id)}" title="${esc(a.name)}">${a.icon || '📦'}</button>`).join('')
+    + `<span class="u-dsp"></span>`
+    + `<button class="u-dock" data-act="agent" title="全能 agent 对话栏">💬</button>`
+    + ['设置', '口袋', '示波器', '模型'].map(k =>
+      `<button class="u-dock" data-win="${k}" title="${k}">${k === '设置' ? '⚙' : k === '口袋' ? '🎒' : k === '示波器' ? '📈' : '🧠'}</button>`).join('');
+}
+// ══════════ 内置窗 ══════════
+const 内置 = {
+  模型(身) {
+    // 借 ai 块的选模型小表: ai 不在跑时, 这份文件自带剪来的复制(照跑)
+    let 表;
+    try { 表 = 选模型; } catch (e) {
+      身.innerHTML = `<div class="u-empty">选模型表要 ai 块在跑: ${esc(e.message)}</div>`;
+      return;
+    }
+    Promise.resolve(表.挂(身, { 题: '选模型' }))
+      .catch(e => { 身.innerHTML = `<div class="u-empty">选模型表没画出来: ${esc(e.message)}</div>`; });
+  },
+  设置(身) {
+    // 内核的裸壳面板请进窗: 块管理、导入导出、改内核都走它(系统永远可操作)
+    ctx.call('hypha.panel', { host: 身 })
+      .catch(e => { 身.innerHTML = `<div class="u-empty">面板没画出来: ${esc(e.message)}</div>`; });
+  },
+  口袋(身) {
+    // 口袋块在就请它(数据管理、归属守卫都在那边); 不在就用桌面自带的简版
+    ctx.call('pocket.mount', { el: 身 }).catch(async () => {
+      const 帽 = document.createElement('div');
+      帽.innerHTML = `<div class="u-row"><input class="u-in" placeholder="搜数据前缀或键…" style="flex:1">
+<button class="u-btn" data-a="snap">拍快照</button><button class="u-btn" data-a="list">列快照</button></div><div class="u-list"></div>`;
+      身.appendChild(帽);
+      const 列 = async (q = '') => {
+        const 全 = await ctx.kv.list(''), 表 = 全.filter(e => !q || e.key.includes(q)).slice(0, 300);
+        帽.querySelector('.u-list').innerHTML = 表.map(e => `<div class="u-item" data-k="${esc(e.key)}">
+<span class="u-k">${esc(e.key)}</span><span class="u-v">${esc(JSON.stringify(e.value) ?? '').slice(0, 120)}</span>
+<button class="u-btn" data-a="del">删</button></div>`).join('') || '<div class="u-empty">没有数据</div>';
+      };
+      听(帽, 'click', async e => {
+        const 钮 = e.target.closest('button'); if (!钮) return;
+        try {
+          if (钮.dataset.a === 'snap') { await ctx.call('hypha.snapshot', { name: 新号('snap-') }); await 列(); }
+          if (钮.dataset.a === 'list') {
+            const 快照 = await ctx.call('hypha.snapshots');
+            帽.querySelector('.u-list').innerHTML = 快照.map(s =>
+              `<div class="u-item"><span class="u-k">${esc(s.name)}</span>
+<span class="u-v">${new Date(s.at).toLocaleString()} · ${s.n} 键</span>
+<button class="u-btn" data-a="back" data-n="${esc(s.name)}">回滚到这</button></div>`).join('')
+              + `<div class="u-item"><button class="u-btn" data-a="all">返回数据列表</button></div>`;
+          }
+          if (钮.dataset.a === 'back') { await ctx.call('hypha.snapshot', { name: 钮.dataset.n, restore: true }); await 列(); }
+          if (钮.dataset.a === 'all') await 列();
+          if (钮.dataset.a === 'del') {
+            const k = 钮.closest('.u-item').dataset.k;
+            if (confirm(`删 ${k}?`)) { await ctx.kv.del(k); await 列(); }
+          }
+        } catch (err) { alert(err.message); }
+      });
+      听(帽.querySelector('input'), 'input', e => 列(e.target.value.trim()));
+      列();
+    });
+  },
+  示波器(身) {
+    const 帽 = document.createElement('div');
+    帽.innerHTML = `<div class="u-row"><span class="u-muted">能力调用记录(最近 100 条)</span></div><div class="u-list"></div>`;
+    身.appendChild(帽);
+    const 列 = async () => {
+      const 痕 = await ctx.call('hypha.trace', { limit: 100 });
+      帽.querySelector('.u-list').innerHTML = 痕.reverse().map(s => `<div class="u-item">
+<span class="u-k">${esc(s.path)}</span><span class="u-v">${esc(s.by)} · ${s.ms}ms · ${s.ok ? '✓' : '✗ ' + esc(s.err || '')}</span>
+</div>`).join('') || '<div class="u-empty">还没有调用</div>';
+    };
+    列();
+    ctx.on('mycelium:span', 列);
+  },
+};
+// ══════════ 开孢子 ══════════
+async function 开孢子(id) {
+  const a = UI.apps.get(id) || await ctx.kv.get('app:' + id);
+  if (!a) throw new Error(`没有这个孢子: ${id}`);
+  const w = 窗.开('app:' + id, { 题: (a.icon || '📦') + ' ' + a.name, 宽: 640, 高: 480 });
+  if (w.帧) return w;
+  try {
+    const f = await ctx.call('hypha.mount', {
+      code: a.html, host: w.身, context: { sporeId: id },
+    });
+    w.帧 = f.dataset.mycApp;
+  } catch (e) {
+    w.身.innerHTML = `<div class="u-empty">孢子没跑起来: ${esc(e.message)}</div>`;
+  }
+  return w;
+}
+// ══════════ 点选 ══════════
+// 用户在桌面上划一片, 把那片的 HTML 连选择器一起发给 agent(卡片写着归属, agent 好改)
+const 点选 = {
+  开: false,
+  始() {
+    点选.开 = true;
+    document.body.style.cursor = 'crosshair';
+    $('#pick-tip').hidden = false;
+  },
+  止() {
+    点选.开 = false;
+    document.body.style.cursor = '';
+    $('#pick-tip').hidden = true;
+  },
+};
+// ══════════ 桌面 ══════════
+const 桌面 = {
+  样式: 设计变量 + `
+#desk{position:fixed;inset:0;bottom:44px;overflow:hidden}
+.u-win{position:absolute;left:80px;top:60px;background:var(--bg-2);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:0 12px 40px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden}
+.u-win.u-max{left:0!important;top:0!important;width:100%!important;height:100%!important}
+.u-win.u-min .u-body{display:none}
+.u-bar{display:flex;align-items:center;gap:6px;padding:7px 10px;background:var(--surface);
+  border-bottom:1px solid var(--border);cursor:move;user-select:none}
+.u-t{font-size:12px;font-weight:600}.u-sp{flex:1}
+.u-b{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:12px;padding:2px 6px;border-radius:4px}
+.u-b:hover{background:var(--surface-hover);color:var(--text)}
+.u-body{flex:1;overflow:auto;position:relative}
+#dock{position:fixed;left:0;right:0;bottom:0;height:44px;display:flex;align-items:center;gap:6px;
+  padding:0 12px;background:var(--bg-2);border-top:1px solid var(--border);z-index:100}
+.u-dock{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;
+  padding:5px 10px;cursor:pointer;font-size:14px}
+.u-dock:hover{border-color:var(--accent);color:var(--accent)}
+.u-dsp{flex:1}
+.u-row{display:flex;gap:8px;align-items:center;padding:10px}
+.u-in{background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px}
+.u-btn{background:var(--accent-soft);border:1px solid rgba(126,231,135,.35);color:var(--accent);
+  border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer}
+.u-list{padding:0 10px 10px;font-size:12px}
+.u-item{display:flex;gap:8px;align-items:center;padding:5px 8px;border:1px solid var(--border);border-radius:6px;margin:4px 0}
+.u-k{font-family:var(--mono);font-size:11px;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
+.u-v{flex:1;color:var(--text-muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.u-empty{color:var(--text-muted);font-size:12px;padding:16px;text-align:center}
+.u-muted{color:var(--text-muted);font-size:11px}
+#pick-tip{position:fixed;left:12px;bottom:56px;background:var(--warn);color:#1a1a1a;font-size:12px;
+  padding:6px 12px;border-radius:8px;z-index:200}
+#agent-dock{position:fixed;right:12px;bottom:56px;width:380px;height:480px;background:var(--bg-2);
+  border:1px solid var(--border);border-radius:var(--radius);z-index:90;display:none;flex-direction:column;overflow:hidden;
+  box-shadow:0 12px 40px rgba(0,0,0,.5)}
+#agent-dock.in{display:flex}
+#agent-dock .ag-bar{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--surface);
+  border-bottom:1px solid var(--border);font-size:12px;font-weight:600;cursor:move;user-select:none}
+#agent-dock .ag-bar .sp{flex:1}
+#agent-dock .ag-bar button{background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:13px;padding:2px 7px;border-radius:4px}
+#agent-dock .ag-bar button:hover{background:var(--surface-hover);color:var(--text)}
+#agent-dock .ag-host{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}`,
+  画() {
+    const 样式 = document.createElement('style');
+    样式.textContent = 桌面.样式;
+    document.head.appendChild(样式);
+    const 桌 = document.createElement('div');
+    桌.id = 'desk';
+    桌.innerHTML = `<div id="pick-tip" hidden>点选模式: 点桌面上的东西, 连它的 HTML 一起发给 agent(Esc 退出)</div>`;
+    document.body.appendChild(桌);
+    const 坞 = document.createElement('div');
+    坞.id = 'dock';
+    document.body.appendChild(坞);
+    const 代 = document.createElement('div');
+    代.id = 'agent-dock';
+    代.innerHTML = `<div class="ag-bar">🤖 全能 agent<span class="sp"></span>
+<button data-a="min" title="收起">–</button></div><div class="ag-host"></div>`;
+    document.body.appendChild(代);
+    听(代, 'click', e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      if (钮.dataset.a === 'min') 代.classList.remove('in');
+    });
+    ctx.cleanup(() => { 桌.remove(); 坞.remove(); 代.remove(); 样式.remove(); });
+    // 桌面点选: 点中的元素连选择器一起进卡片
+    听(桌, 'click', e => {
+      if (!点选.开) return;
+      const el = e.target.closest('[data-block-id],[data-spore],.u-win') || e.target;
+      const 择 = el.dataset.blockId ? `[data-block-id="${el.dataset.blockId}"]`
+        : el.dataset.spore ? `[data-spore="${el.dataset.spore}"]` : (el.id ? '#' + el.id : el.className);
+      ctx.call('agent.attach', { name: '点选的 ' + (el.tagName || '').toLowerCase(),
+        text: `选择器: ${择}\n归属: ${el.dataset.blockId ? '块 ' + el.dataset.blockId : el.dataset.spore ? '孢子 ' + el.dataset.spore : '桌面'}\n` + el.outerHTML.slice(0, 4000) })
+        .then(() => { 点选.止(); }).catch(() => { });
+    });
+    听(document, 'keydown', e => { if (e.key === 'Escape') 点选.止(); });
+    听(坞, 'click', e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      if (钮.dataset.app) 开孢子(钮.dataset.app).catch(err => alert(err.message));
+      if (钮.dataset.act === 'agent') {
+        const 代 = $('#agent-dock');
+        if (代) 代.classList.toggle('in');
+      }      if (钮.dataset.win) {
+        const k = 钮.dataset.win;
+        // 口袋块自己开着窗(收编开的)就直接前置, 不重复挂一份
+        if (k === '口袋' && UI.wins.has('block:pocket')) { 窗.前置('block:pocket'); return; }
+        if (UI.wins.has(k)) 窗.前置(k);
+        else 窗.开(k, { 题: k, 宽: k === '设置' ? 620 : 480, 高: 460, 内容: 内置[k] });
+      }
+    });
+    任务栏();
+    return true;
+  },
+};
+// ══════════ 给 agent 的界面能力 ══════════
+// ui.state 看眼前, ui.do 动手: 目标用对象名(app:<id>、win:<键>、desk、desktop), 动作照「能做」
+ctx.provide('ui.state', () => ({
+  桌面: { 对象: 'desk', 能做: ['重画', '点选模式'] },
+  窗: 窗.全部().map(k => {
+    const w = UI.wins.get(k);
+    return { 对象: 'win:' + k, 题: w.题, 收起: w.el.classList.contains('u-min'), 帧: w.帧 || null,
+      能做: ['前置', '关', '收起', '最大化'] };
+  }),
+  孢子: [...UI.apps.values()].map(a => ({ 对象: 'app:' + a.id, 名: a.name, 图标: a.icon,
+    开着: UI.wins.has('app:' + a.id), 字节: a.html.length, 能做: ['开', '改代码', '删'] })),
+}), { desc: '看界面上有什么: 桌面、开着的窗、孢子, 每样一个对象名和能做的动作', schema: {} });
+ctx.provide('ui.do', a => {
+  const [类, 名] = String(a.target || '').split(':');
+  const 值 = a.value;
+  if (a.target === 'desk' || a.target === 'desktop') {
+    if (a.action === '重画') { 任务栏(); return { ok: true }; }
+    if (a.action === '点选模式') { 点选.开 ? 点选.止() : 点选.始(); return { ok: true, 开: 点选.开 }; }
+  }
+  if (类 === 'app') {
+    if (a.action === '开') return 开孢子(名).then(() => ({ ok: true }));
+    if (a.action === '删') return ctx.kv.del('app:' + 名).then(() => 应用.载()).then(() => ({ ok: true }));
+  }
+  if (类 === 'win') {
+    const w = UI.wins.get(名);
+    if (!w) throw new Error(`没有开着的窗: ${a.target}(用 ui.state 看有哪些)`);
+    if (a.action === '前置') { 窗.前置(名); return { ok: true }; }
+    if (a.action === '关') return { ok: 窗.关(名) };
+    if (a.action === '收起') { w.el.classList.toggle('u-min'); return { ok: true }; }
+    if (a.action === '最大化') { w.el.classList.toggle('u-max'); return { ok: true }; }
+  }
+  throw new Error(`不会对 ${a.target} 做 ${a.action}(能用什么看 ui.state)`);
+}, { desc: '对界面上的东西做动作: target 用 ui.state 里的对象名, action 用它「能做」里的名字',
+  schema: { target: { type: 'string', description: '对象名' }, action: { type: 'string' }, value: {} } });
+ctx.provide('apps.list', () => 应用.列(), { desc: '小应用(孢子)清单', schema: {} });
+ctx.provide('apps.create', a => 应用.建(a), { desc: '建一个小应用(孢子): 一段 HTML, 隔离窗里跑',
+  schema: { name: { type: 'string' }, html: { type: 'string' }, icon: { type: 'string' } } });
+ctx.provide('apps.open', a => 开孢子(a.id).then(() => ({ ok: true })), { desc: '开一个小应用的窗',
+  schema: { id: { type: 'string' } } });
+ctx.provide('apps.update', a => 应用.改(a.id, a.html).then(() => ({ ok: true })), { desc: '改一个小应用的代码',
+  schema: { id: { type: 'string' }, html: { type: 'string' } } });
+ctx.provide('ui.host', () => true, { desc: '本块在跑: 有桌面(内核因此不挂兜底面板)', schema: {} });
+// ══════════ 收编 ══════════
+// 桌面是布局的唯一主人: 别的块的界面(ctx.root)本来在页面上流式堆着, 会被 #desk 盖住——
+// 把它们收进该去的地方: agent → 右下对话栏; 别的块 → 各自的窗。块后装/被替换都会再收一次。
+const 收编 = async () => {
+  const 根们 = [...document.querySelectorAll('#mycelium-root > [data-nodule-id]')];
+  if (!根们.length) return;
+  let 名 = {};
+  try { 名 = Object.fromEntries((await ctx.call('hypha.nodules')).map(b => [b.id, b])); } catch (e) { }
+  for (const el of 根们) {
+    const id = el.dataset.noduleId;
+    if (id === 'desktop' || el.dataset.已收编) continue;
+    el.dataset.已收编 = '1';
+    const 块 = 名[id] || {};
+    el.style.height = '100%';
+    if (id === 'agent') {
+      // 全能 agent: 右下常驻对话栏(默认开着, 任务栏能收起)
+      const 代 = $('#agent-dock');
+      if (代) {
+        const 位 = 代.querySelector('.ag-host') || 代;
+        位.appendChild(el);
+        代.classList.add('in');
+      }
+      continue;
+    }
+    // 别的有界面的块(AI 配置、次元口袋…): 开一个窗, 把它的页搬进去
+    窗.开('block:' + id, { 题: (块.icon || '▪') + ' ' + (块.name || id), 宽: 560, 高: 480,
+      内容: 身 => 身.appendChild(el) });
+  }
+};
+// ══════════ 装配 ══════════
+(async () => {
+  await 应用.载();
+  if (ctx.root) {
+    ctx.root.style.display = 'none';       // 桌面的界面直接画在 body 上, 这个根空着不用
+    // 桌面画不上不耽误能力(ui.state/ui.do/apps.* 照常)
+    try {
+      桌面.画();
+      // 用户自己的孢子默认铺在桌面上: 拖 HTML 文件进来也能建
+      听(document, 'dragover', e => e.preventDefault());
+      听(document, 'drop', async e => {
+        e.preventDefault();
+        const 文 = e.dataTransfer?.files?.[0];
+        if (!文) return;
+        const html = await 文.text();
+        const a = await 应用.建({ name: 文.name.replace(/\.html?$/, ''), html });
+        await 开孢子(a.id);
+      });
+      ctx.on('mycelium:apps', 任务栏);
+      // 收编: 先收已在场的(ai/agent), 之后块变了(新装、被替换)再收
+      收编().catch(e => ctx.log('收编没成:', e.message));
+      ctx.on('mycelium:blocks', () => { 收编().catch(() => { }); });
+    } catch (e) { ctx.log('桌面没画出来(能力照常用):', e.message); }
+  }
+})();
+return {};
+</script>
+<script type="mycelium/nodule" data-id="pocket">
+/*NODULE*/{"id":"pocket","name":"次元口袋","icon":"🎒","version":1,"caps":["data"]}/*CODE*/
+'use strict';
+// ↦ 借 hypha 的 离体运行时
+// ══════════ 自报 ══════════
+// 看、搜、改、删存着的数据; agent 要动数据也经这里(守归属: 谁的前缀谁管)
+// 数据 {"prefix": "settings:pocket.", "label": "口袋设置(连着的文件夹)", "kind": "config"}
+// 数据 {"prefix": "media:", "label": "文件和笔记", "kind": "data"}
+// 现在 data.own
+// ══════════ 技能 ══════════
+// 只写猜不到的事实, 只有注释、不跑
+// 【动数据】要读、写、删系统里的数据时: data.list 看有哪些前缀, data.get 读, data.set 写, data.del 删。
+//   写到别的块认领的前缀会被挡(归它管, 改它走它自报里写的 edit 能力)——那是为了不让两块互相盖。
+//   真要绕过(比如整库搬迁)用 data.clean {key, force: true}。删人的东西前三思, 删了回不来(除非有快照)。
+// 【连电脑文件夹】用户要把某个文件夹接进来时: pocket.pickFolder 让用户亲手选(浏览器要求必须人点),
+//   之后 disk:<文件夹名>/<路径> 就是那个文件夹里的文件, data.get/list 照常用, data.set 写回去。
+// ══════════ 基础 ══════════
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => '&#' + c.charCodeAt(0) + ';');
+// ══════════ 归属 ══════════
+// 谁的前缀谁管: 各块在「自报」段里写 数据 {prefix…}, 最长的前缀算数。写了 edit 的前缀,
+// 只有主人(或没有主人在跑)能经口袋写。两块认同一个前缀: 谁都不能经口袋写(说清是谁)。
+const 归属 = {
+  表: [],
+  async 载() {
+    const bs = (colony.单独 ? [{ id: ctx.id, name: '次元口袋', about: {
+      desc: '看、搜、改、删存着的数据', data: [{ prefix: 'settings:pocket.', label: '口袋设置', kind: 'config' }] } }]
+      : await ctx.call('hypha.nodules')).filter(b => !b.broken);
+    归属.表 = bs.flatMap(b => ((b.about || {}).data || []).filter(n => n?.prefix)
+      .map(n => Object.assign({}, n, { owner: b.id, 块: b.name || b.id, running: b.running })))
+      .concat([{ prefix: 'block:', label: '块的改版', owner: 'hypha', 块: 'Hypha', running: true,
+        edit: 'hypha.setNodule' }])
+      .sort((a, b) => b.prefix.length - a.prefix.length);
+  },
+  of: k => 归属.表.find(n => k.startsWith(n.prefix)),
+  守(k, by, 删) {
+    if (删 && by === ctx.id) return;                    // 人在口袋里亲手点的删: 不拦
+    const n = 归属.of(k);
+    if (!n) return;
+    if (n.两家) throw Object.assign(new Error(`「${k}」两块都认(${n.两家.join('、')}), 经口袋谁都不能写`), { 人话: '两块都认它, 这里改不了' });
+    if (n.edit && by !== n.owner && n.running)
+      throw Object.assign(new Error(`「${k}」归${n.块}管, 改它走 ${n.edit}`), { 人话: `归「${n.块}」管, 这里改不了` });
+  },
+};
+// ══════════ 数据 ══════════
+// agent 和人都经这几个能力动数据; 写之前过归属守卫, 每次写留痕(journal)
+ctx.provide('data.list', async a => {
+  const 全 = await ctx.kv.list(a.prefix || '');
+  return 全.filter(e => !e.key.startsWith('block:')).map(e => ({ key: e.key,
+    值: JSON.stringify(e.value) ?? '', 字节: JSON.stringify(e.value)?.length || 0,
+    归: 归属.of(e.key)?.块 || '(没人认领)' })).slice(0, a.limit || 500);
+}, { desc: '列数据: 每项的键、值(JSON 摘要)、归哪块管; prefix 只要这个前缀', schema: {
+  prefix: { type: 'string' }, limit: { type: 'number' } } });
+ctx.provide('data.get', async a => {
+  const v = await ctx.kv.get(a.key);
+  if (v == null) throw new Error(`没有这个键: ${a.key}(用 data.list 看有哪些)`);
+  return { key: a.key, value: v, 归: 归属.of(a.key)?.块 || '(没人认领)' };
+}, { desc: '读一个键', schema: { key: { type: 'string', description: '键名' } } });
+ctx.provide('data.set', async a => {
+  归属.守(a.key, a.by || 'pocket');
+  await ctx.kv.set(a.key, a.value);
+  return { key: a.key, 字节: JSON.stringify(a.value)?.length || 0, 归: 归属.of(a.key)?.块 || '(没人认领, 已记在口袋名下)' };
+}, { desc: '写一个键(值要能变 JSON); 归别的块管的前缀会被挡, 照提示走它的能力', schema: {
+  key: { type: 'string', description: '键名' }, value: { description: '要存的值(能 JSON 化的都行)' },
+  by: { type: 'string', description: '谁在写(挡归属时看)' } } });
+ctx.provide('data.del', async a => {
+  归属.守(a.key, a.by || 'pocket', true);
+  await ctx.kv.del(a.key);
+  return { key: a.key, 删了: true };
+}, { desc: '删一个键(人在口袋里删不拦; agent 删归人的数据会被挡)', schema: {
+  key: { type: 'string' }, by: { type: 'string' } } });
+ctx.provide('data.own', async a => {
+  await 归属.载();
+  const n = 归属.of(a.key || '');
+  return n ? { key: a.key, 归属: n.块, owner: n.owner, label: n.label, kind: n.kind,
+    edit: n.edit || null, running: n.running } : { key: a.key, 归属: '(没人认领)' };
+}, { desc: '一个键归哪块管、改它该走哪个能力', schema: { key: { type: 'string' } } });
+ctx.provide('data.clean', async a => {
+  if (!a.force) {
+    const n = 归属.of(a.key);
+    if (n && n.owner !== 'pocket') throw new Error(`「${a.key}」归${n.块}管, 要硬删给 force: true(想清楚)`);
+  }
+  await ctx.kv.del(a.key);
+  return { key: a.key, 删了: true };
+}, { desc: '硬删: 绕过归属守卫(整库搬迁、清理没人认领的数据用)', schema: {
+  key: { type: 'string' }, force: { type: 'boolean' } } });
+// ══════════ 口袋窗 ══════════
+// 桌面块的「口袋」窗把这个挂进自己的窗体(pocket.mount); 没有桌面块时能力照常用
+const 口袋 = {
+  样式: `.pk{font:13px/1.6 -apple-system,"PingFang SC",sans-serif;color:var(--text,#e8ecf0);height:100%;display:flex;flex-direction:column}
+.pk .row{display:flex;gap:8px;align-items:center;padding:10px}
+.pk input{flex:1;background:rgba(255,255,255,.05);border:1px solid var(--border,rgba(255,255,255,.09));
+  color:inherit;border-radius:6px;padding:5px 8px;font-size:12px}
+.pk button{background:var(--accent-soft,rgba(126,231,135,.12));border:1px solid rgba(126,231,135,.35);
+  color:var(--accent,#7ee787);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer}
+.pk .list{flex:1;overflow:auto;padding:0 10px 10px}
+.pk .item{display:flex;gap:8px;align-items:center;padding:5px 8px;border:1px solid var(--border,rgba(255,255,255,.09));
+  border-radius:6px;margin:4px 0;font-size:12px}
+.pk .k{font-family:var(--mono,monospace);font-size:11px;color:var(--accent,#7ee787);max-width:38%;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pk .v{flex:1;color:var(--text-muted,#9aa4ad);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pk .own{font-size:10px;color:var(--text-muted,#9aa4ad);white-space:nowrap}
+.pk .empty{color:var(--text-muted,#9aa4ad);text-align:center;padding:24px;font-size:12px}
+.pk .edit{width:100%;min-height:120px;background:rgba(0,0,0,.3);border:1px solid var(--border);color:inherit;
+  border-radius:6px;padding:8px;font-family:var(--mono,monospace);font-size:11px}`,
+  async 挂(host) {
+    const 听宿主 = (el, ev, fn) => { el.addEventListener(ev, fn); ctx.cleanup(() => el.removeEventListener(ev, fn)); };
+    host.innerHTML = `<style>${口袋.样式}</style><div class="pk">
+<div class="row"><input placeholder="搜键或值…"><button data-a="新">新键</button>
+<button data-a="快照">拍快照</button><button data-a="文件夹">连文件夹</button></div>
+<div class="list"></div></div>`;
+    const 列 = async (q = '') => {
+      const 全 = await ctx.kv.list(''), 表 = 全.filter(e => !q || e.key.includes(q)
+        || JSON.stringify(e.value).includes(q)).slice(0, 300);
+      host.querySelector('.list').innerHTML = 表.map(e => `<div class="item" data-k="${esc(e.key)}">
+<span class="k">${esc(e.key)}</span>
+<span class="v">${esc((JSON.stringify(e.value) ?? '').slice(0, 140))}</span>
+<span class="own">${esc(归属.of(e.key)?.块 || '没人认领')}</span>
+<button data-a="改">改</button><button data-a="删">删</button></div>`).join('')
+        || '<div class="empty">没有数据</div>';
+    };
+    听宿主(host, 'click', async e => {
+      const 钮 = e.target.closest('button'); if (!钮) return;
+      const 项 = 钮.closest('.item'), k = 项?.dataset.k;
+      try {
+        if (钮.dataset.a === '新') {
+          const 名 = prompt('新键的名字(前缀.名字):');
+          if (!名) return;
+          const 值 = prompt('值(JSON):', '{}');
+          await ctx.kv.set(名, JSON.parse(值 || '{}'));
+          await 列();
+        }
+        if (钮.dataset.a === '改' && k) {
+          const v = await ctx.kv.get(k);
+          const 值 = prompt(`改 ${k} 的值(JSON):`, JSON.stringify(v, null, 1));
+          if (值 == null) return;
+          await ctx.kv.set(k, JSON.parse(值));
+          await 列();
+        }
+        if (钮.dataset.a === '删' && k) {
+          if (!confirm(`删 ${k}?`)) return;
+          await ctx.kv.del(k);
+          await 列();
+        }
+        if (钮.dataset.a === '快照') { await ctx.call('hypha.snapshot', { name: 'snap-' + Date.now().toString(36) }); alert('拍好了, 设置窗里能回滚'); }
+        if (钮.dataset.a === '文件夹') { await 磁盘.选(); }
+      } catch (err) { alert(err.message); }
+    });
+    听宿主(host.querySelector('input'), 'input', e => 列(e.target.value.trim()));
+    await 归属.载();
+    await 列();
+    ctx.on('mycelium:journal', () => { });
+    return () => { host.innerHTML = ''; };
+  },
+};
+ctx.provide('pocket.mount', a => 口袋.挂(a.el || a.host), { desc: '把口袋窗挂进 el(桌面的口袋窗用它)',
+  schema: { el: {}, host: { type: 'string' } } });
+// ══════════ 磁盘 ══════════
+// 用户亲手选的文件夹: 键写 disk:<文件夹名>/<路径>。句柄存在库里(IndexedDB 能直接存句柄)
+const 磁盘 = {
+  async 选() {
+    if (!window.showDirectoryPicker) throw new Error('这个浏览器不支持选文件夹(要 Chrome/Edge 86+)');
+    const 柄 = await window.showDirectoryPicker();
+    const 名 = 柄.name;
+    await ctx.kv.set('settings:pocket.folder.' + 名, 柄);
+    return { 连上: 名 };
+  },
+  柄: async 名 => ctx.kv.get('settings:pocket.folder.' + 名),
+};
+// ══════════ 装配 ══════════
+if (ctx.root) {
+  // 口袋窗挂不上不耽误能力(data.* 照常)
+  try {
+    const 位 = document.createElement('div');
+    位.style.cssText = 'height:100%';
+    ctx.root.appendChild(位);
+    口袋.挂(位).then(off => off && ctx.cleanup(off)).catch(e => ctx.log('口袋窗没挂上:', e.message));
+  } catch (e) { ctx.log('口袋窗没挂上(能力照常用):', e.message); }
+}
+(async () => { await 归属.载(); })();
+return {};
+</script>
+</body>
+</html>
